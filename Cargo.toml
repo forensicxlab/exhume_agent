@@ -1,0 +1,52 @@
+[package]
+name = "exhume_agent"
+version = "0.1.0"
+edition = "2021"
+description = "Autonomous forensic assistant CLI using LLMs and the Exhume framework."
+repository = "https://github.com/forensicxlab/exhume"
+documentation = "https://github.com/forensicxlab/exhume"
+authors = ["Thanatology Assistant", "k1nd0ne"]
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "exhume_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exhume-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI and configuration
+clap = { version = "4.4", features = ["derive", "env"] }
+dotenvy = "0.15"
+
+# Terminal REPL
+rustyline = "14.0"
+colored = "2.1"
+
+# LLM Framework
+rig-core = "=0.31.0"
+
+# Error handling and tracing
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Exhume Core dependencies
+exhume_body = { path = "../exhume_body" }
+exhume_partitions = { path = "../exhume_partitions" }
+exhume_filesystem = { path = "../exhume_filesystem" }
+exhume_lvm = { path = "../exhume_lvm" }
+exhume_indexer = { path = "../exhume_indexer" }
+
+# Database
+sqlx = { version = "0.8.2", features = ["sqlite", "runtime-tokio"] }
+exhume_artefacts = { path = "../exhume_artefacts" }
+hex = "0.4"
