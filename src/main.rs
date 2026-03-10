@@ -13,8 +13,12 @@ pub mod index;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the disk image (EWF, raw, etc.)
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "folder")]
     image: Option<String>,
+
+    /// Path to a local folder to analyze
+    #[arg(short, long, conflicts_with = "image")]
+    folder: Option<String>,
 
     /// LLM Provider (openai, ollama, anthropic, etc.)
     #[arg(short, long, env = "AGENT_PROVIDER")]
@@ -27,6 +31,14 @@ struct Args {
     /// API base endpoint (mostly for Ollama or OpenAI compatible proxies)
     #[arg(short, long, env = "AGENT_ENDPOINT")]
     endpoint: Option<String>,
+
+    /// Treat the image as a single logical volume (no partition discovery)
+    #[arg(short, long)]
+    logical: bool,
+
+    /// Start a fresh conversation (clears chat history from the database)
+    #[arg(short = 'n', long)]
+    new_session: bool,
 }
 
 use tracing_subscriber::EnvFilter;
@@ -48,23 +60,29 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", " 🕵️  Exhume Agent - Autonomous Forensic Assistant".blue().bold());
     println!("{}", "===============================================\n".blue().bold());
 
-    let image_path = match args.image {
-        Some(path) => path,
-        None => {
-            eprintln!("{}", "Error: No disk image provided. Use --image <PATH>".red());
+    let (target_path, is_folder) = match (args.image, args.folder) {
+        (Some(img), None) => (img, false),
+        (None, Some(fld)) => (fld, true),
+        _ => {
+            eprintln!("{}", "Error: You must provide either --image <PATH> or --folder <PATH>".red());
             exit(1);
         }
     };
 
-    println!("{} {}", "Target Image:".bold(), image_path);
+    println!("{} {}", if is_folder { "Target Folder:".bold() } else { "Target Image:".bold() }, target_path);
 
-    // Verify the image can be opened
-    let body_res = std::panic::catch_unwind(|| {
-        Body::new(image_path.clone(), "auto")
-    });
-    
-    if body_res.is_err() {
-        eprintln!("{}", format!("Error: Failed to open image at {}", image_path).red());
+    if !is_folder {
+        // Verify the image can be opened
+        let body_res = std::panic::catch_unwind(|| {
+            Body::new(target_path.clone(), "auto")
+        });
+        
+        if body_res.is_err() {
+            eprintln!("{}", format!("Error: Failed to open image at {}", target_path).red());
+            exit(1);
+        }
+    } else if !std::path::Path::new(&target_path).is_dir() {
+        eprintln!("{}", format!("Error: {} is not a valid directory.", target_path).red());
         exit(1);
     }
     
@@ -75,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     println!("{} {}", "LLM Model:".bold(), config.model);
 
     // Initialize Index
-    let pool = match index::init_index(&image_path).await {
+    let pool = match index::init_index(&target_path, is_folder, args.logical).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{} Failed to initialize or open local index: {}", "Error:".red(), e);
@@ -85,12 +103,20 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     // Initialize the Agent Wrapper
-    let agent = ExhumeAgent::new(config, image_path, std::sync::Arc::new(pool));
+    let agent = ExhumeAgent::new(config, target_path, std::sync::Arc::new(pool), args.logical);
 
     println!("{}", "Agent Initialized. Type 'exit' or 'quit' to stop.".green());
 
     let mut rl = rustyline::DefaultEditor::new()?;
-    let mut history: Vec<Message> = Vec::new();
+    let mut history = agent.load_history().await.unwrap_or_default();
+
+    if args.new_session && !history.is_empty() {
+        println!("{} Clearing {} message(s) from previous session.", "🗑️".yellow(), history.len());
+        let _ = agent.clear_history().await;
+        history.clear();
+    } else if !history.is_empty() {
+        println!("{} Loaded {} messages from history.", "ℹ️".blue(), history.len());
+    }
 
     println!("\n{}", "===============================================\n".blue());
 
@@ -110,8 +136,9 @@ async fn main() -> anyhow::Result<()> {
 
                 rl.add_history_entry(input)?;
                 
-                // Add user message to local history (or the agent could manage it entirely)
+                // Add user message to local history and database
                 let user_msg = Message::user(input);
+                let _ = agent.save_message(&user_msg).await;
                 history.push(user_msg);
                 
                 println!();
@@ -120,7 +147,9 @@ async fn main() -> anyhow::Result<()> {
                 match agent.chat(&history).await {
                     Ok(response) => {
                         println!("{}\n{}\n", "Agent >".magenta().bold(), response);
-                        history.push(Message::assistant(response));
+                        let assistant_msg = Message::assistant(response);
+                        let _ = agent.save_message(&assistant_msg).await;
+                        history.push(assistant_msg);
                     }
                     Err(e) => {
                         eprintln!("{} {}\n", "Error:".red().bold(), e);

@@ -3,6 +3,7 @@ use exhume_partitions::Partitions;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
+use colored::Colorize;
 
 #[derive(Deserialize)]
 pub struct ListPartitionsArgs {}
@@ -57,6 +58,7 @@ impl Tool for ListPartitionsTool {
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+        println!("  {} {}...", "🛠️".magenta(), "Listing partitions".bold());
         let mut body = Body::new(self.image_path.clone(), "auto");
 
         let sector_size = body.get_sector_size();

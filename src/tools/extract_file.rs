@@ -1,14 +1,18 @@
-use exhume_body::Body;
-use exhume_filesystem::detected_fs::detect_filesystem;
+use crate::evidence_io;
 use exhume_filesystem::Filesystem;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
+use colored::Colorize;
+use log::error;
+use sqlx::SqlitePool;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct ExtractFileArgs {
     pub offset: u64,
     pub partition_size: u64,
+    pub partition_id: Option<i64>,
     pub file_id: u64,
     pub max_bytes: Option<usize>,
 }
@@ -28,11 +32,13 @@ pub struct ExtractFileError(pub String);
 #[derive(Clone)]
 pub struct ExtractFileTool {
     image_path: String,
+    extraction_dir: std::path::PathBuf,
+    pool: Arc<SqlitePool>,
 }
 
 impl ExtractFileTool {
-    pub fn new(image_path: String) -> Self {
-        Self { image_path }
+    pub fn new(image_path: String, extraction_dir: std::path::PathBuf, pool: Arc<SqlitePool>) -> Self {
+        Self { image_path, extraction_dir, pool }
     }
 }
 
@@ -58,6 +64,10 @@ impl Tool for ExtractFileTool {
                         "type": "integer",
                         "description": "The absolute size in bytes of the partition."
                     },
+                    "partition_id": {
+                        "type": "integer",
+                        "description": "The partition ID from the index database. If provided, offset/partition_size are ignored and resolved automatically."
+                    },
                     "file_id": {
                         "type": "integer",
                         "description": "The file ID of the file to read within the filesystem."
@@ -73,18 +83,18 @@ impl Tool for ExtractFileTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let body = Body::new(self.image_path.clone(), "auto");
+        println!("  {} {} (id: {})...", "🛠️".magenta(), "Extracting file content".bold(), args.file_id);
 
-        let mut fs = match detect_filesystem(&body, args.offset, args.partition_size, None) {
-            Ok(fs) => fs,
-            Err(e) => {
-                return Ok(ExtractFileOutput {
-                    content_utf8: None,
-                    size_read: 0,
-                    is_truncated: false,
-                    error: Some(format!("Could not mount partition: {}", e)),
-                });
-            }
+        let mut fs = if let Some(pid) = args.partition_id {
+            evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)
+                .await
+                .map_err(|e| ExtractFileError(e.to_string()))?
+        } else {
+            use exhume_body::Body;
+            use exhume_filesystem::detected_fs::detect_filesystem;
+            let body = Body::new(self.image_path.clone(), "auto");
+            detect_filesystem(&body, args.offset, args.partition_size, None)
+                .map_err(|e| ExtractFileError(format!("Could not mount partition: {}", e)))?
         };
 
         let file = match fs.get_file(args.file_id) {
@@ -101,24 +111,36 @@ impl Tool for ExtractFileTool {
 
         let max_len = args.max_bytes.unwrap_or(8192);
 
-        match fs.read_file_prefix(&file, max_len + 1) {
+        match fs.read_file_content(&file) {
             Ok(data) => {
-                let is_truncated = data.len() > max_len;
-                let actual_data = if is_truncated { &data[..max_len] } else { &data };
+                // Persistent dump to host filesystem
+                let dump_filename = format!("file_{}", args.file_id);
+                let dump_path = self.extraction_dir.join(dump_filename);
+                
+                if let Err(e) = std::fs::write(&dump_path, &data) {
+                    error!("Failed to dump file to host: {}", e);
+                }
 
-                // Try to parse as UTF-8 string for easy reading by the LLM
-                let content_utf8 = match String::from_utf8(actual_data.to_vec()) {
+                let actual_len = data.len();
+                let is_truncated = actual_len > max_len;
+                let display_data = if is_truncated { &data[..max_len] } else { &data };
+
+                let content_utf8 = match String::from_utf8(display_data.to_vec()) {
                     Ok(s) => Some(s),
                     Err(_) => {
-                        // Fallback to lossy if it's mostly text with some bad chars, 
-                        // but if it's completely binary, the LLM will just get messy printable string.
-                        Some(String::from_utf8_lossy(actual_data).into_owned())
+                        Some(String::from_utf8_lossy(display_data).into_owned())
                     }
                 };
 
+                let msg = format!(
+                    "File ID {} extracted to host at: {:?}. ({} bytes read)",
+                    args.file_id, dump_path, actual_len
+                );
+                println!("  {} {}", "💾".green(), msg);
+
                 Ok(ExtractFileOutput {
                     content_utf8,
-                    size_read: actual_data.len(),
+                    size_read: actual_len,
                     is_truncated,
                     error: None,
                 })

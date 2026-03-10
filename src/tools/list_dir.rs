@@ -1,15 +1,18 @@
-use exhume_body::Body;
-use exhume_filesystem::detected_fs::detect_filesystem;
-use exhume_filesystem::filesystem::{DirectoryCommon, FileCommon};
+use crate::evidence_io;
 use exhume_filesystem::Filesystem;
+use exhume_filesystem::filesystem::{DirectoryCommon, FileCommon};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
+use colored::Colorize;
+use sqlx::SqlitePool;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct ListDirArgs {
     pub offset: u64,
     pub partition_size: u64,
+    pub partition_id: Option<i64>,
     pub file_id: Option<u64>,
 }
 
@@ -34,11 +37,12 @@ pub struct ListDirError(pub String);
 #[derive(Clone)]
 pub struct ListDirTool {
     image_path: String,
+    pool: Arc<SqlitePool>,
 }
 
 impl ListDirTool {
-    pub fn new(image_path: String) -> Self {
-        Self { image_path }
+    pub fn new(image_path: String, pool: Arc<SqlitePool>) -> Self {
+        Self { image_path, pool }
     }
 }
 
@@ -64,6 +68,10 @@ impl Tool for ListDirTool {
                         "type": "integer",
                         "description": "The absolute size in bytes of the partition."
                     },
+                    "partition_id": {
+                        "type": "integer",
+                        "description": "The partition ID from the index database. If provided, offset/partition_size are ignored and resolved automatically."
+                    },
                     "file_id": {
                         "type": "integer",
                         "description": "The file ID of the directory to list. Leave this empty/omitted to list the root directory."
@@ -75,16 +83,18 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let body = Body::new(self.image_path.clone(), "auto");
+        println!("  {} {} (id: {})...", "🛠️".magenta(), "Listing directory".bold(), args.file_id.unwrap_or(0));
 
-        let mut fs = match detect_filesystem(&body, args.offset, args.partition_size, None) {
-            Ok(fs) => fs,
-            Err(e) => {
-                return Ok(ListDirOutput {
-                    entries: vec![],
-                    error: Some(format!("Could not mount partition: {}", e)),
-                });
-            }
+        let mut fs = if let Some(pid) = args.partition_id {
+            evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)
+                .await
+                .map_err(|e| ListDirError(e.to_string()))?
+        } else {
+            use exhume_body::Body;
+            use exhume_filesystem::detected_fs::detect_filesystem;
+            let body = Body::new(self.image_path.clone(), "auto");
+            detect_filesystem(&body, args.offset, args.partition_size, None)
+                .map_err(|e| ListDirError(format!("Could not mount partition: {}", e)))?
         };
 
         let target_id = args.file_id.unwrap_or_else(|| fs.get_root_file_id());
@@ -101,13 +111,8 @@ impl Tool for ListDirTool {
 
         match fs.list_dir(&dir_file) {
             Ok(entries) => {
-                // To keep the reply compact for the LLM, we resolve file sizes for dirs where we can,
-                // but for speed we might not get full sizes.
                 let mut results = Vec::new();
                 for entry in entries {
-                    // Try to get the actual file to reliably determine is_dir and size
-                    // Since DetectedDir doesn't have is_dir/size in DirectoryCommon 
-                    // (it only has file_id() and name()), we fetch the file.
                     if let Ok(file) = fs.get_file(entry.file_id()) {
                         results.push(DirEntryInfo {
                             file_id: entry.file_id(),
@@ -116,11 +121,10 @@ impl Tool for ListDirTool {
                             size: file.size(),
                         });
                     } else {
-                        // Fallback if get_file fails for some reason
-                         results.push(DirEntryInfo {
+                        results.push(DirEntryInfo {
                             file_id: entry.file_id(),
                             name: entry.name().to_string(),
-                            is_dir: false, // Defaulting for fallback
+                            is_dir: false,
                             size: 0,
                         });
                     }
