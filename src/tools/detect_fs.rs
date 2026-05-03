@@ -1,9 +1,10 @@
 use crate::evidence_io;
+use crate::ui::UiHandle;
+use colored::Colorize;
 use exhume_filesystem::Filesystem;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use colored::Colorize;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -28,11 +29,16 @@ pub struct DetectFilesystemError(pub String);
 pub struct DetectFilesystemTool {
     image_path: String,
     pool: Arc<SqlitePool>,
+    ui: Option<UiHandle>,
 }
 
 impl DetectFilesystemTool {
-    pub fn new(image_path: String, pool: Arc<SqlitePool>) -> Self {
-        Self { image_path, pool }
+    pub fn new(image_path: String, pool: Arc<SqlitePool>, ui: Option<UiHandle>) -> Self {
+        Self {
+            image_path,
+            pool,
+            ui,
+        }
     }
 }
 
@@ -69,7 +75,16 @@ impl Tool for DetectFilesystemTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {} (offset: {})...", "🛠️".magenta(), "Detecting filesystem".bold(), args.offset);
+        if let Some(ui) = &self.ui {
+            ui.log(format!("Detecting filesystem at offset {}...", args.offset));
+        } else {
+            println!(
+                "  {} {} (offset: {})...",
+                "🛠️".magenta(),
+                "Detecting filesystem".bold(),
+                args.offset
+            );
+        }
 
         let fs_res = if let Some(pid) = args.partition_id {
             evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)

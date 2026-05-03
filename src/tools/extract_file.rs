@@ -1,10 +1,11 @@
 use crate::evidence_io;
+use crate::ui::UiHandle;
+use colored::Colorize;
 use exhume_filesystem::Filesystem;
+use log::error;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use colored::Colorize;
-use log::error;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -34,11 +35,22 @@ pub struct ExtractFileTool {
     image_path: String,
     extraction_dir: std::path::PathBuf,
     pool: Arc<SqlitePool>,
+    ui: Option<UiHandle>,
 }
 
 impl ExtractFileTool {
-    pub fn new(image_path: String, extraction_dir: std::path::PathBuf, pool: Arc<SqlitePool>) -> Self {
-        Self { image_path, extraction_dir, pool }
+    pub fn new(
+        image_path: String,
+        extraction_dir: std::path::PathBuf,
+        pool: Arc<SqlitePool>,
+        ui: Option<UiHandle>,
+    ) -> Self {
+        Self {
+            image_path,
+            extraction_dir,
+            pool,
+            ui,
+        }
     }
 }
 
@@ -52,7 +64,8 @@ impl Tool for ExtractFileTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Reads the contents of a file located within a specific partition.".to_string(),
+            description: "Reads the contents of a file located within a specific partition."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -83,7 +96,19 @@ impl Tool for ExtractFileTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {} (id: {})...", "🛠️".magenta(), "Extracting file content".bold(), args.file_id);
+        if let Some(ui) = &self.ui {
+            ui.log(format!(
+                "Extracting file content for file_id={}...",
+                args.file_id
+            ));
+        } else {
+            println!(
+                "  {} {} (id: {})...",
+                "🛠️".magenta(),
+                "Extracting file content".bold(),
+                args.file_id
+            );
+        }
 
         let mut fs = if let Some(pid) = args.partition_id {
             evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)
@@ -116,27 +141,33 @@ impl Tool for ExtractFileTool {
                 // Persistent dump to host filesystem
                 let dump_filename = format!("file_{}", args.file_id);
                 let dump_path = self.extraction_dir.join(dump_filename);
-                
+
                 if let Err(e) = std::fs::write(&dump_path, &data) {
                     error!("Failed to dump file to host: {}", e);
                 }
 
                 let actual_len = data.len();
                 let is_truncated = actual_len > max_len;
-                let display_data = if is_truncated { &data[..max_len] } else { &data };
+                let display_data = if is_truncated {
+                    &data[..max_len]
+                } else {
+                    &data
+                };
 
                 let content_utf8 = match String::from_utf8(display_data.to_vec()) {
                     Ok(s) => Some(s),
-                    Err(_) => {
-                        Some(String::from_utf8_lossy(display_data).into_owned())
-                    }
+                    Err(_) => Some(String::from_utf8_lossy(display_data).into_owned()),
                 };
 
                 let msg = format!(
                     "File ID {} extracted to host at: {:?}. ({} bytes read)",
                     args.file_id, dump_path, actual_len
                 );
-                println!("  {} {}", "💾".green(), msg);
+                if let Some(ui) = &self.ui {
+                    ui.log(msg);
+                } else {
+                    println!("  {} {}", "💾".green(), msg);
+                }
 
                 Ok(ExtractFileOutput {
                     content_utf8,

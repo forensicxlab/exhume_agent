@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,7 +22,13 @@ impl AgentConfig {
 
         let model = arg_model
             .or_else(|| env::var("AGENT_MODEL").ok())
-            .unwrap_or_else(|| "llama3".to_string());
+            .unwrap_or_else(|| {
+                if provider == "copilot" {
+                    "forensic-qwen".to_string()
+                } else {
+                    "llama3".to_string()
+                }
+            });
 
         let endpoint = arg_endpoint
             .or_else(|| env::var("AGENT_ENDPOINT").ok())
@@ -31,19 +37,29 @@ impl AgentConfig {
                     "http://127.0.0.1:11434/api".to_string()
                 } else if provider == "openai" {
                     "https://api.openai.com/v1".to_string()
+                } else if provider == "copilot" {
+                    "http://10.0.0.198".to_string()
                 } else {
                     "".to_string()
                 }
             });
 
         let api_key = env::var("AGENT_API_KEY")
-            .unwrap_or_else(|_| {
-                env::var("OPENAI_API_KEY").unwrap_or_default()
-            });
+            .unwrap_or_else(|_| env::var("OPENAI_API_KEY").unwrap_or_default());
 
         if provider == "openai" && api_key.is_empty() {
-             anyhow::bail!("OpenAI API key is missing. Set AGENT_API_KEY or OPENAI_API_KEY environment variable.");
+            anyhow::bail!("OpenAI API key is missing. Set AGENT_API_KEY or OPENAI_API_KEY environment variable.");
         }
+
+        // Ensure the endpoint always has a protocol so HTTP clients don't fail silently.
+        let endpoint = if !endpoint.is_empty()
+            && !endpoint.starts_with("http://")
+            && !endpoint.starts_with("https://")
+        {
+            format!("http://{}", endpoint)
+        } else {
+            endpoint
+        };
 
         Ok(Self {
             provider,

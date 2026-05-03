@@ -1,10 +1,11 @@
 use crate::evidence_io;
-use exhume_filesystem::Filesystem;
+use crate::ui::UiHandle;
+use colored::Colorize;
 use exhume_filesystem::filesystem::{DirectoryCommon, FileCommon};
+use exhume_filesystem::Filesystem;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use colored::Colorize;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
@@ -38,11 +39,16 @@ pub struct ListDirError(pub String);
 pub struct ListDirTool {
     image_path: String,
     pool: Arc<SqlitePool>,
+    ui: Option<UiHandle>,
 }
 
 impl ListDirTool {
-    pub fn new(image_path: String, pool: Arc<SqlitePool>) -> Self {
-        Self { image_path, pool }
+    pub fn new(image_path: String, pool: Arc<SqlitePool>, ui: Option<UiHandle>) -> Self {
+        Self {
+            image_path,
+            pool,
+            ui,
+        }
     }
 }
 
@@ -56,7 +62,8 @@ impl Tool for ListDirTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Lists the contents of a directory within a specific partition.".to_string(),
+            description: "Lists the contents of a directory within a specific partition."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -83,7 +90,19 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {} (id: {})...", "🛠️".magenta(), "Listing directory".bold(), args.file_id.unwrap_or(0));
+        if let Some(ui) = &self.ui {
+            ui.log(format!(
+                "Listing directory for file_id={}...",
+                args.file_id.unwrap_or(0)
+            ));
+        } else {
+            println!(
+                "  {} {} (id: {})...",
+                "🛠️".magenta(),
+                "Listing directory".bold(),
+                args.file_id.unwrap_or(0)
+            );
+        }
 
         let mut fs = if let Some(pid) = args.partition_id {
             evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)
@@ -104,7 +123,10 @@ impl Tool for ListDirTool {
             Err(e) => {
                 return Ok(ListDirOutput {
                     entries: vec![],
-                    error: Some(format!("Failed to read directory with id {}: {}", target_id, e)),
+                    error: Some(format!(
+                        "Failed to read directory with id {}: {}",
+                        target_id, e
+                    )),
                 });
             }
         };

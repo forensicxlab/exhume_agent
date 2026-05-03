@@ -1,9 +1,10 @@
+use crate::ui::UiHandle;
+use colored::Colorize;
 use exhume_body::Body;
 use exhume_partitions::Partitions;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use colored::Colorize;
 
 #[derive(Deserialize)]
 pub struct ListPartitionsArgs {}
@@ -30,17 +31,18 @@ pub struct PartitionError(pub String);
 
 pub struct ListPartitionsTool {
     image_path: String,
+    ui: Option<UiHandle>,
 }
 
 impl ListPartitionsTool {
-    pub fn new(image_path: String) -> Self {
-        Self { image_path }
+    pub fn new(image_path: String, ui: Option<UiHandle>) -> Self {
+        Self { image_path, ui }
     }
 }
 
 impl Tool for ListPartitionsTool {
     const NAME: &'static str = "list_partitions";
-    
+
     type Args = ListPartitionsArgs;
     type Output = ListPartitionsOutput;
     type Error = PartitionError;
@@ -58,7 +60,11 @@ impl Tool for ListPartitionsTool {
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {}...", "🛠️".magenta(), "Listing partitions".bold());
+        if let Some(ui) = &self.ui {
+            ui.log("Listing partitions...");
+        } else {
+            println!("  {} {}...", "🛠️".magenta(), "Listing partitions".bold());
+        }
         let mut body = Body::new(self.image_path.clone(), "auto");
 
         let sector_size = body.get_sector_size();

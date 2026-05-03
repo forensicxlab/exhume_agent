@@ -3,5 +3,6 @@ pub mod extract_file;
 pub mod list_dir;
 pub mod partitions;
 pub mod query_index;
-pub mod specialists;
+pub mod report;
 pub mod shell;
+pub mod specialists;

@@ -1,6 +1,6 @@
 [package]
 name = "exhume_agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Autonomous forensic assistant CLI using LLMs and the Exhume framework."
 repository = "https://github.com/forensicxlab/exhume"
@@ -24,8 +24,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 dotenvy = "0.15"
 
-# Terminal REPL
-rustyline = "14.0"
+# Terminal output
 colored = "2.1"
 
 # LLM Framework

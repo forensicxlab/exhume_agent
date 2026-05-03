@@ -1,15 +1,16 @@
 use crate::config::AgentConfig;
 use crate::db_helpers::{ensure_ai_artifact, store_specialist_result};
 use crate::evidence_io::extract_file_bytes;
-use log::error;
+use crate::ui::UiHandle;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use colored::Colorize;
+use log::{debug, error};
 use rig::client::CompletionClient;
 use rig::completion::{Prompt, ToolDefinition};
 use rig::providers::{ollama, openai};
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use colored::Colorize;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 #[derive(Deserialize)]
 pub struct DelegateArgs {
@@ -24,44 +25,198 @@ pub struct SpecialistError {
 }
 
 /// Helper to build a specialist sub-agent prompt using the configured provider.
-async fn specialist_prompt(config: &AgentConfig, preamble: &str, prompt_text: &str) -> Result<String, SpecialistError> {
+async fn specialist_prompt(
+    config: &AgentConfig,
+    preamble: &str,
+    prompt_text: &str,
+) -> Result<String, SpecialistError> {
     match config.provider.as_str() {
         "openai" => {
-            let client: openai::Client = openai::Client::new(&config.api_key)
-                .map_err(|e| SpecialistError { message: format!("Failed to initialize OpenAI client: {}", e) })?;
+            let client: openai::Client =
+                openai::Client::new(&config.api_key).map_err(|e| SpecialistError {
+                    message: format!("Failed to initialize OpenAI client: {}", e),
+                })?;
             let agent = client.agent(&config.model).preamble(preamble).build();
-            agent.prompt(prompt_text).await
-                .map_err(|e| SpecialistError { message: format!("Specialist LLM call failed: {}", e) })
+            agent
+                .prompt(prompt_text)
+                .await
+                .map_err(|e| SpecialistError {
+                    message: format!("Specialist LLM call failed: {}", e),
+                })
         }
         "ollama" => {
             let mut builder = ollama::Client::builder();
             if !config.endpoint.is_empty() {
                 builder = builder.base_url(&config.endpoint);
             }
-            let client: ollama::Client = builder.api_key(rig::client::Nothing).build()
-                .map_err(|e| SpecialistError { message: format!("Failed to initialize Ollama client: {}", e) })?;
+            let client: ollama::Client =
+                builder
+                    .api_key(rig::client::Nothing)
+                    .build()
+                    .map_err(|e| SpecialistError {
+                        message: format!("Failed to initialize Ollama client: {}", e),
+                    })?;
             let agent = client.agent(&config.model).preamble(preamble).build();
-            agent.prompt(prompt_text).await
-                .map_err(|e| SpecialistError { message: format!("Specialist LLM call failed: {}", e) })
+            agent
+                .prompt(prompt_text)
+                .await
+                .map_err(|e| SpecialistError {
+                    message: format!("Specialist LLM call failed: {}", e),
+                })
         }
-        other => Err(SpecialistError { message: format!("Unsupported specialist provider: {}", other) }),
+        "copilot" => {
+            // forensic-llm is an OpenAI-compatible vLLM server (Chat Completions) on port 8000
+            let llm_url = format!("{}:8000/v1", config.endpoint.trim_end_matches('/'));
+            debug!("[copilot] specialist LLM → {} (model: {})", llm_url, config.model);
+            let client: openai::CompletionsClient = openai::CompletionsClient::builder()
+                .api_key("no-key")
+                .base_url(&llm_url)
+                .build()
+                .map_err(|e| SpecialistError {
+                    message: format!("Failed to initialize copilot client: {}", e),
+                })?;
+            let agent = client.agent(&config.model).preamble(preamble).build();
+            agent
+                .prompt(prompt_text)
+                .await
+                .map_err(|e| SpecialistError {
+                    message: format!("Specialist LLM call failed: {}", e),
+                })
+        }
+        other => Err(SpecialistError {
+            message: format!("Unsupported specialist provider: {}", other),
+        }),
     }
 }
 
+/// Send a base64-encoded image to the dfi-copilot image2text service and return the description.
+async fn copilot_image_describe(
+    base_url: &str,
+    image_base64: &str,
+    file_name: &str,
+) -> Result<String, SpecialistError> {
+    let url = format!("{}:8001/v1/describe", base_url.trim_end_matches('/'));
+    debug!("[copilot] image2text POST {} (file: '{}')", url, file_name);
+    let body = serde_json::json!({
+        "image_base64": image_base64,
+        "prompt": "You are a forensic image analyst. Describe this image in forensic detail. \
+                   Identify all visible people, objects, text, locations, timestamps, and activities. \
+                   Note anything that may be relevant to a criminal or civil investigation."
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| SpecialistError {
+            message: format!("image2text: connection to {} failed: {}", url, e),
+        })?;
+
+    let status = resp.status();
+    debug!("[copilot] image2text response status: {}", status);
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SpecialistError {
+            message: format!("image2text returned HTTP {} for '{}': {}", status, file_name, body),
+        });
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| SpecialistError {
+        message: format!("image2text response parse failed ({}): {}", url, e),
+    })?;
+    debug!("[copilot] image2text raw response: {}", json);
+    json.get("text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| SpecialistError {
+            message: format!(
+                "image2text returned no 'text' field for '{}'. Full response: {}",
+                file_name, json
+            ),
+        })
+}
+
+/// Send an audio file to the dfi-copilot audio2text service and return the transcription text.
+async fn copilot_audio_transcribe(
+    base_url: &str,
+    audio_bytes: Vec<u8>,
+    ext: &str,
+    file_name: &str,
+) -> Result<String, SpecialistError> {
+    let url = format!("{}:8002/v1/transcribe", base_url.trim_end_matches('/'));
+    debug!(
+        "[copilot] audio2text POST {} (file: '{}', {} bytes, ext: {})",
+        url,
+        file_name,
+        audio_bytes.len(),
+        ext
+    );
+    let mime = format!("audio/{}", ext);
+    let part = reqwest::multipart::Part::bytes(audio_bytes)
+        .file_name(format!("audio.{}", ext))
+        .mime_str(&mime)
+        .map_err(|e| SpecialistError {
+            message: format!("Failed to build multipart for '{}': {}", file_name, e),
+        })?;
+    let form = reqwest::multipart::Form::new().part("file", part);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| SpecialistError {
+            message: format!("audio2text: connection to {} failed: {}", url, e),
+        })?;
+
+    let status = resp.status();
+    debug!("[copilot] audio2text response status: {}", status);
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SpecialistError {
+            message: format!("audio2text returned HTTP {} for '{}': {}", status, file_name, body),
+        });
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| SpecialistError {
+        message: format!("audio2text response parse failed ({}): {}", url, e),
+    })?;
+    debug!("[copilot] audio2text raw response: {}", json);
+    json.get("text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| SpecialistError {
+            message: format!(
+                "audio2text returned no 'text' field for '{}'. Full response: {}",
+                file_name, json
+            ),
+        })
+}
+
 /// Helper to build a specialist vision prompt using OpenAI (vision requires OpenAI).
-async fn specialist_vision_prompt(config: &AgentConfig, preamble: &str, message: rig::completion::Message) -> Result<String, SpecialistError> {
+async fn specialist_vision_prompt(
+    config: &AgentConfig,
+    preamble: &str,
+    message: rig::completion::Message,
+) -> Result<String, SpecialistError> {
     // Vision analysis requires OpenAI with gpt-4o regardless of configured provider
     let api_key = if config.api_key.is_empty() {
-        return Err(SpecialistError { message: "OpenAI API Key is missing. Vision model requires a valid OpenAI Key.".to_string() });
+        return Err(SpecialistError {
+            message: "OpenAI API Key is missing. Vision model requires a valid OpenAI Key."
+                .to_string(),
+        });
     } else {
         &config.api_key
     };
 
-    let client: openai::Client = openai::Client::new(api_key)
-        .map_err(|e| SpecialistError { message: format!("Failed to initialize OAI client: {}", e) })?;
+    let client: openai::Client = openai::Client::new(api_key).map_err(|e| SpecialistError {
+        message: format!("Failed to initialize OAI client: {}", e),
+    })?;
     let agent = client.agent("gpt-4o").preamble(preamble).build();
-    agent.prompt(message).await
-        .map_err(|e| SpecialistError { message: format!("Vision Analysis failed: {}", e) })
+    agent.prompt(message).await.map_err(|e| SpecialistError {
+        message: format!("Vision Analysis failed: {}", e),
+    })
 }
 
 // ──────────────────────── Image Specialist ────────────────────────
@@ -73,17 +228,32 @@ pub struct DelegateImageSpecialist {
     pub config: AgentConfig,
     pub image_path: String,
     pub extraction_dir: std::path::PathBuf,
+    pub ui: Option<UiHandle>,
 }
 
 impl DelegateImageSpecialist {
-    pub fn new(evidence_pool: std::sync::Arc<sqlx::SqlitePool>, evidence_id: i64, config: AgentConfig, image_path: String, extraction_dir: std::path::PathBuf) -> Self {
-        Self { evidence_pool, evidence_id, config, image_path, extraction_dir }
+    pub fn new(
+        evidence_pool: std::sync::Arc<sqlx::SqlitePool>,
+        evidence_id: i64,
+        config: AgentConfig,
+        image_path: String,
+        extraction_dir: std::path::PathBuf,
+        ui: Option<UiHandle>,
+    ) -> Self {
+        Self {
+            evidence_pool,
+            evidence_id,
+            config,
+            image_path,
+            extraction_dir,
+            ui,
+        }
     }
 }
 
 impl Tool for DelegateImageSpecialist {
     const NAME: &'static str = "delegate_image_specialist";
-    
+
     type Args = DelegateArgs;
     type Output = String;
     type Error = SpecialistError;
@@ -110,16 +280,42 @@ impl Tool for DelegateImageSpecialist {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {} (id: {})...", "🛠️".magenta(), "Delegating to Image Specialist".bold(), args.file_id);
+        if let Some(ui) = &self.ui {
+            ui.log(format!(
+                "Delegating file_id={} to Image Specialist...",
+                args.file_id
+            ));
+        } else {
+            println!(
+                "  {} {} (id: {})...",
+                "🛠️".magenta(),
+                "Delegating to Image Specialist".bold(),
+                args.file_id
+            );
+        }
         let (content, file_name, absolute_path, _dump_path) = extract_file_bytes(
-            &*self.evidence_pool, &self.image_path, args.file_id, args.partition_id, &self.extraction_dir
-        ).await.map_err(|e| SpecialistError { message: e.to_string() })?;
+            &*self.evidence_pool,
+            &self.image_path,
+            args.file_id,
+            args.partition_id,
+            &self.extraction_dir,
+        )
+        .await
+        .map_err(|e| SpecialistError {
+            message: e.to_string(),
+        })?;
 
         if content.len() > 20_000_000 {
-            return Err(SpecialistError { message: "Image file is too large to process visually (>20MB).".to_string() });
+            return Err(SpecialistError {
+                message: "Image file is too large to process visually (>20MB).".to_string(),
+            });
         }
 
-        let ext = std::path::Path::new(&absolute_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let ext = std::path::Path::new(&absolute_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         let mime_type = match ext.as_str() {
             "png" => "image/png",
             "gif" => "image/gif",
@@ -128,7 +324,6 @@ impl Tool for DelegateImageSpecialist {
         };
 
         let base64_data = BASE64.encode(&content);
-        let data_uri = format!("data:{};base64,{}", mime_type, base64_data);
 
         let preamble = "You are an AI Image Specialist. Your job is to deeply analyze images for forensic evidence. \
             Focus on uncovering hidden intent, suspects, illegal objects, metadata, or sensitive communication.\
@@ -137,18 +332,38 @@ impl Tool for DelegateImageSpecialist {
             - `summary`: A concise 1-2 sentence description explaining the forensic significance.\
             Do not include any markdown format tags like ```json.";
 
-        let image_message = rig::completion::Message::User { 
-            content: rig::one_or_many::OneOrMany::many(
-                vec![
-                    rig::completion::message::UserContent::text("Analyze this extracted evidence image."),
-                    rig::completion::message::UserContent::image_url(data_uri, None, None)
-                ]
-            ).unwrap()
+        let response = if self.config.provider == "copilot" {
+            // Two-step pipeline: Qwen-VL describes the image, forensic-llm scores it
+            let description =
+                copilot_image_describe(&self.config.endpoint, &base64_data, &file_name).await?;
+            specialist_prompt(
+                &self.config,
+                preamble,
+                &format!(
+                    "File: {}\nVisual description produced by a vision model:\n{}",
+                    file_name, description
+                ),
+            )
+            .await?
+        } else {
+            let data_uri = format!("data:{};base64,{}", mime_type, base64_data);
+            let image_message = rig::completion::Message::User {
+                content: rig::one_or_many::OneOrMany::many(vec![
+                    rig::completion::message::UserContent::text(
+                        "Analyze this extracted evidence image.",
+                    ),
+                    rig::completion::message::UserContent::image_url(data_uri, None, None),
+                ])
+                .unwrap(),
+            };
+            specialist_vision_prompt(&self.config, preamble, image_message).await?
         };
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_end_matches("```")
+            .trim();
 
-        let response = specialist_vision_prompt(&self.config, preamble, image_message).await?;
-        let cleaned = response.trim().trim_start_matches("```json").trim_end_matches("```").trim();
-        
         let val: serde_json::Value = serde_json::from_str(cleaned).unwrap_or_else(|_| {
             serde_json::json!({
                 "score": 0,
@@ -157,22 +372,48 @@ impl Tool for DelegateImageSpecialist {
         });
 
         use sqlx::Row;
-        let db_id_res = sqlx::query("SELECT id FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1")
-            .bind(args.file_id as i64)
-            .bind(args.partition_id)
-            .fetch_one(&*self.evidence_pool).await;
+        let db_id_res = sqlx::query(
+            "SELECT id FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1",
+        )
+        .bind(args.file_id as i64)
+        .bind(args.partition_id)
+        .fetch_one(&*self.evidence_pool)
+        .await;
 
         if let Ok(row) = db_id_res {
             let file_db_id: i64 = row.get("id");
-            if let Ok(art_id) = ensure_ai_artifact(&*self.evidence_pool, self.evidence_id, args.partition_id, file_db_id, "AI Image Analysis").await {
+            if let Ok(art_id) = ensure_ai_artifact(
+                &*self.evidence_pool,
+                self.evidence_id,
+                args.partition_id,
+                file_db_id,
+                "AI Image Analysis",
+            )
+            .await
+            {
                 let _ = store_specialist_result(
-                    &*self.evidence_pool, self.evidence_id, args.partition_id, file_db_id, art_id, &file_name, "Image Analysis", None, &val
-                ).await;
+                    &*self.evidence_pool,
+                    self.evidence_id,
+                    args.partition_id,
+                    file_db_id,
+                    art_id,
+                    &file_name,
+                    "Image Analysis",
+                    None,
+                    &val,
+                )
+                .await;
             }
         }
 
-        let summary = val.get("summary").and_then(|s| s.as_str()).unwrap_or("No summary provided");
-        Ok(format!("Image Specialist Analysis Complete for '{}'. Summary: {}", file_name, summary))
+        let summary = val
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or("No summary provided");
+        Ok(format!(
+            "Image Specialist Analysis Complete for '{}'. Summary: {}",
+            file_name, summary
+        ))
     }
 }
 
@@ -185,17 +426,32 @@ pub struct DelegateAudioSpecialist {
     pub config: AgentConfig,
     pub image_path: String,
     pub extraction_dir: std::path::PathBuf,
+    pub ui: Option<UiHandle>,
 }
 
 impl DelegateAudioSpecialist {
-    pub fn new(evidence_pool: std::sync::Arc<sqlx::SqlitePool>, evidence_id: i64, config: AgentConfig, image_path: String, extraction_dir: std::path::PathBuf) -> Self {
-        Self { evidence_pool, evidence_id, config, image_path, extraction_dir }
+    pub fn new(
+        evidence_pool: std::sync::Arc<sqlx::SqlitePool>,
+        evidence_id: i64,
+        config: AgentConfig,
+        image_path: String,
+        extraction_dir: std::path::PathBuf,
+        ui: Option<UiHandle>,
+    ) -> Self {
+        Self {
+            evidence_pool,
+            evidence_id,
+            config,
+            image_path,
+            extraction_dir,
+            ui,
+        }
     }
 }
 
 impl Tool for DelegateAudioSpecialist {
     const NAME: &'static str = "delegate_audio_specialist";
-    
+
     type Args = DelegateArgs;
     type Output = String;
     type Error = SpecialistError;
@@ -222,56 +478,114 @@ impl Tool for DelegateAudioSpecialist {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {} (id: {})...", "🛠️".magenta(), "Delegating to Audio Specialist".bold(), args.file_id);
-        let (content, file_name, absolute_path, _dump_path) = extract_file_bytes(
-            &*self.evidence_pool, &self.image_path, args.file_id, args.partition_id, &self.extraction_dir
-        ).await.map_err(|e| SpecialistError { message: e.to_string() })?;
-
-        if self.config.api_key.is_empty() {
-            return Err(SpecialistError { message: "OpenAI API Key is missing. Whisper transcription requires a valid OpenAI Key.".to_string() });
+        if let Some(ui) = &self.ui {
+            ui.log(format!(
+                "Delegating file_id={} to Audio Specialist...",
+                args.file_id
+            ));
+        } else {
+            println!(
+                "  {} {} (id: {})...",
+                "🛠️".magenta(),
+                "Delegating to Audio Specialist".bold(),
+                args.file_id
+            );
         }
+        let (content, file_name, absolute_path, _dump_path) = extract_file_bytes(
+            &*self.evidence_pool,
+            &self.image_path,
+            args.file_id,
+            args.partition_id,
+            &self.extraction_dir,
+        )
+        .await
+        .map_err(|e| SpecialistError {
+            message: e.to_string(),
+        })?;
 
-        use std::io::Write;
-        
-        let ext = std::path::Path::new(&absolute_path).extension().and_then(|e| e.to_str()).unwrap_or("wav").to_lowercase();
-        let temp_file_builder = tempfile::Builder::new().suffix(&format!(".{}", ext)).tempfile();
-        let mut temp_file = temp_file_builder.map_err(|e| SpecialistError { message: format!("Failed to create temp file: {}", e) })?;
-        
-        temp_file.write_all(&content).map_err(|e| SpecialistError { message: format!("Failed to write to temp file: {}", e) })?;
-        temp_file.flush().map_err(|_| SpecialistError { message: "Failed to flush temp audio file".to_string() })?;
+        let ext = std::path::Path::new(&absolute_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("wav")
+            .to_lowercase();
 
-        let path_buf = temp_file.path().to_path_buf();
-        let api_key_clone = self.config.api_key.clone();
-        
-        let res = tokio::task::spawn_blocking(move || -> Result<reqwest::blocking::Response, String> {
-            let client = reqwest::blocking::Client::new();
-            let form = match reqwest::blocking::multipart::Form::new()
-                .text("model", "whisper-1")
-                .file("file", &path_buf) {
-                    Ok(f) => f,
-                    Err(e) => return Err(e.to_string()),
-                };
+        let transcription = if self.config.provider == "copilot" {
+            copilot_audio_transcribe(&self.config.endpoint, content.clone(), &ext, &file_name)
+                .await?
+        } else {
+            if self.config.api_key.is_empty() {
+                return Err(SpecialistError {
+                    message: "OpenAI API Key is missing. Whisper transcription requires a valid OpenAI Key."
+                        .to_string(),
+                });
+            }
 
-            client
-                .post("https://api.openai.com/v1/audio/transcriptions")
-                .bearer_auth(api_key_clone)
-                .multipart(form)
-                .send()
-                .map_err(|e| e.to_string())
-        }).await.map_err(|e| SpecialistError { message: format!("Tokio blocking error: {}", e) })?;
+            use std::io::Write;
 
-        let transcription = match res {
-            Ok(r) => {
-                let json: serde_json::Value = r.json().unwrap_or_default();
-                if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
-                    text.to_string()
-                } else if let Some(error) = json.get("error").and_then(|v| v.get("message")).and_then(|v| v.as_str()) {
-                    return Err(SpecialistError { message: format!("Whisper API Error: {}", error) });
-                } else {
-                    return Err(SpecialistError { message: "Transcription failed, no text returned.".to_string() });
+            let temp_file_builder = tempfile::Builder::new()
+                .suffix(&format!(".{}", ext))
+                .tempfile();
+            let mut temp_file = temp_file_builder.map_err(|e| SpecialistError {
+                message: format!("Failed to create temp file: {}", e),
+            })?;
+            temp_file.write_all(&content).map_err(|e| SpecialistError {
+                message: format!("Failed to write to temp file: {}", e),
+            })?;
+            temp_file.flush().map_err(|_| SpecialistError {
+                message: "Failed to flush temp audio file".to_string(),
+            })?;
+
+            let path_buf = temp_file.path().to_path_buf();
+            let api_key_clone = self.config.api_key.clone();
+
+            let res = tokio::task::spawn_blocking(
+                move || -> Result<reqwest::blocking::Response, String> {
+                    let client = reqwest::blocking::Client::new();
+                    let form = match reqwest::blocking::multipart::Form::new()
+                        .text("model", "whisper-1")
+                        .file("file", &path_buf)
+                    {
+                        Ok(f) => f,
+                        Err(e) => return Err(e.to_string()),
+                    };
+                    client
+                        .post("https://api.openai.com/v1/audio/transcriptions")
+                        .bearer_auth(api_key_clone)
+                        .multipart(form)
+                        .send()
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await
+            .map_err(|e| SpecialistError {
+                message: format!("Tokio blocking error: {}", e),
+            })?;
+
+            match res {
+                Ok(r) => {
+                    let json: serde_json::Value = r.json().unwrap_or_default();
+                    if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                        text.to_string()
+                    } else if let Some(error) = json
+                        .get("error")
+                        .and_then(|v| v.get("message"))
+                        .and_then(|v| v.as_str())
+                    {
+                        return Err(SpecialistError {
+                            message: format!("Whisper API Error: {}", error),
+                        });
+                    } else {
+                        return Err(SpecialistError {
+                            message: "Transcription failed, no text returned.".to_string(),
+                        });
+                    }
                 }
-            },
-            Err(e) => return Err(SpecialistError { message: format!("Reqwest failed for Whisper: {}", e) })
+                Err(e) => {
+                    return Err(SpecialistError {
+                        message: format!("Reqwest failed for Whisper: {}", e),
+                    })
+                }
+            }
         };
 
         let preamble = "You are an AI Audio Specialist. You will receive a raw dialogue transcription. \
@@ -281,9 +595,18 @@ impl Tool for DelegateAudioSpecialist {
             - `summary`: A concise 1-2 sentence description explaining the forensic significance.\
             Do not include any markdown format tags like ```json.";
 
-        let response = specialist_prompt(&self.config, preamble, &format!("File: {}\nTranscription:\n{}", file_name, transcription)).await?;
-        let cleaned = response.trim().trim_start_matches("```json").trim_end_matches("```").trim();
-        
+        let response = specialist_prompt(
+            &self.config,
+            preamble,
+            &format!("File: {}\nTranscription:\n{}", file_name, transcription),
+        )
+        .await?;
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_end_matches("```")
+            .trim();
+
         let val: serde_json::Value = serde_json::from_str(cleaned).unwrap_or_else(|_| {
             serde_json::json!({
                 "score": 0,
@@ -293,26 +616,55 @@ impl Tool for DelegateAudioSpecialist {
         });
 
         use sqlx::Row;
-        let db_id_res = sqlx::query("SELECT id FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1")
-            .bind(args.file_id as i64)
-            .bind(args.partition_id)
-            .fetch_one(&*self.evidence_pool).await;
+        let db_id_res = sqlx::query(
+            "SELECT id FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1",
+        )
+        .bind(args.file_id as i64)
+        .bind(args.partition_id)
+        .fetch_one(&*self.evidence_pool)
+        .await;
 
         if let Ok(row) = db_id_res {
             let file_db_id: i64 = row.get("id");
-            if let Ok(art_id) = ensure_ai_artifact(&*self.evidence_pool, self.evidence_id, args.partition_id, file_db_id, "AI Audio Analysis").await {
+            if let Ok(art_id) = ensure_ai_artifact(
+                &*self.evidence_pool,
+                self.evidence_id,
+                args.partition_id,
+                file_db_id,
+                "AI Audio Analysis",
+            )
+            .await
+            {
                 let mut db_val = val.clone();
                 if let Some(obj) = db_val.as_object_mut() {
-                    obj.insert("transcription".to_string(), serde_json::json!(transcription));
+                    obj.insert(
+                        "transcription".to_string(),
+                        serde_json::json!(transcription),
+                    );
                 }
                 let _ = store_specialist_result(
-                    &*self.evidence_pool, self.evidence_id, args.partition_id, file_db_id, art_id, &file_name, "Audio Analysis", Some(&transcription), &db_val
-                ).await;
+                    &*self.evidence_pool,
+                    self.evidence_id,
+                    args.partition_id,
+                    file_db_id,
+                    art_id,
+                    &file_name,
+                    "Audio Analysis",
+                    Some(&transcription),
+                    &db_val,
+                )
+                .await;
             }
         }
 
-        let summary = val.get("summary").and_then(|s| s.as_str()).unwrap_or("No summary provided");
-        Ok(format!("Audio Specialist Analysis Complete for '{}'. Summary: {}", file_name, summary))
+        let summary = val
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or("No summary provided");
+        Ok(format!(
+            "Audio Specialist Analysis Complete for '{}'. Summary: {}",
+            file_name, summary
+        ))
     }
 }
 
@@ -325,17 +677,32 @@ pub struct DelegateSqliteSpecialist {
     pub config: AgentConfig,
     pub image_path: String,
     pub extraction_dir: std::path::PathBuf,
+    pub ui: Option<UiHandle>,
 }
 
 impl DelegateSqliteSpecialist {
-    pub fn new(evidence_pool: std::sync::Arc<sqlx::SqlitePool>, evidence_id: i64, config: AgentConfig, image_path: String, extraction_dir: std::path::PathBuf) -> Self {
-        Self { evidence_pool, evidence_id, config, image_path, extraction_dir }
+    pub fn new(
+        evidence_pool: std::sync::Arc<sqlx::SqlitePool>,
+        evidence_id: i64,
+        config: AgentConfig,
+        image_path: String,
+        extraction_dir: std::path::PathBuf,
+        ui: Option<UiHandle>,
+    ) -> Self {
+        Self {
+            evidence_pool,
+            evidence_id,
+            config,
+            image_path,
+            extraction_dir,
+            ui,
+        }
     }
 }
 
 impl Tool for DelegateSqliteSpecialist {
     const NAME: &'static str = "delegate_sqlite_specialist";
-    
+
     type Args = DelegateArgs;
     type Output = String;
     type Error = SpecialistError;
@@ -362,15 +729,41 @@ impl Tool for DelegateSqliteSpecialist {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("  {} {} (id: {})...", "🛠️".magenta(), "Delegating to SQLite Specialist".bold(), args.file_id);
+        if let Some(ui) = &self.ui {
+            ui.log(format!(
+                "Delegating file_id={} to SQLite Specialist...",
+                args.file_id
+            ));
+        } else {
+            println!(
+                "  {} {} (id: {})...",
+                "🛠️".magenta(),
+                "Delegating to SQLite Specialist".bold(),
+                args.file_id
+            );
+        }
         let (content, file_name, _, dump_path) = extract_file_bytes(
-            &*self.evidence_pool, &self.image_path, args.file_id, args.partition_id, &self.extraction_dir
-        ).await.map_err(|e| SpecialistError { message: e.to_string() })?;
+            &*self.evidence_pool,
+            &self.image_path,
+            args.file_id,
+            args.partition_id,
+            &self.extraction_dir,
+        )
+        .await
+        .map_err(|e| SpecialistError {
+            message: e.to_string(),
+        })?;
 
         use std::io::Write;
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| SpecialistError { message: format!("Failed to create temp file: {}", e) })?;
-        temp_file.write_all(&content).map_err(|e| SpecialistError { message: format!("Failed to write to temp file: {}", e) })?;
-        temp_file.flush().map_err(|_| SpecialistError { message: "Failed to flush temp sqlite file".to_string() })?;
+        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| SpecialistError {
+            message: format!("Failed to create temp file: {}", e),
+        })?;
+        temp_file.write_all(&content).map_err(|e| SpecialistError {
+            message: format!("Failed to write to temp file: {}", e),
+        })?;
+        temp_file.flush().map_err(|_| SpecialistError {
+            message: "Failed to flush temp sqlite file".to_string(),
+        })?;
 
         let db_path = dump_path.display().to_string();
         let uri = format!("sqlite://{}", db_path);
@@ -378,13 +771,17 @@ impl Tool for DelegateSqliteSpecialist {
         let temp_pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect(&uri)
             .await
-            .map_err(|e| SpecialistError { message: format!("Failed to open temp extracted sqlite DB: {}", e) })?;
+            .map_err(|e| SpecialistError {
+                message: format!("Failed to open temp extracted sqlite DB: {}", e),
+            })?;
 
         use sqlx::Row;
         let rows = sqlx::query("SELECT sql FROM sqlite_master WHERE type='table'")
             .fetch_all(&temp_pool)
             .await
-            .map_err(|e| SpecialistError { message: format!("Failed to extract schema from sqlite: {}", e) })?;
+            .map_err(|e| SpecialistError {
+                message: format!("Failed to extract schema from sqlite: {}", e),
+            })?;
 
         let mut schema_blobs = Vec::new();
         for row in rows {
@@ -409,9 +806,18 @@ impl Tool for DelegateSqliteSpecialist {
             - `summary`: A concise 1-2 sentence description explaining the forensic significance of this database structure.\
             Do not include any markdown format tags like ```json.";
 
-        let response = specialist_prompt(&self.config, preamble, &format!("File: {}\nSchema:\n{}", file_name, schema_trimmed)).await?;
-        let cleaned = response.trim().trim_start_matches("```json").trim_end_matches("```").trim();
-        
+        let response = specialist_prompt(
+            &self.config,
+            preamble,
+            &format!("File: {}\nSchema:\n{}", file_name, schema_trimmed),
+        )
+        .await?;
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_end_matches("```")
+            .trim();
+
         let val: serde_json::Value = serde_json::from_str(cleaned).unwrap_or_else(|_| {
             serde_json::json!({
                 "score": 0,
@@ -420,25 +826,54 @@ impl Tool for DelegateSqliteSpecialist {
             })
         });
 
-        let db_id_res = sqlx::query("SELECT id FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1")
-            .bind(args.file_id as i64)
-            .bind(args.partition_id)
-            .fetch_one(&*self.evidence_pool).await;
+        let db_id_res = sqlx::query(
+            "SELECT id FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1",
+        )
+        .bind(args.file_id as i64)
+        .bind(args.partition_id)
+        .fetch_one(&*self.evidence_pool)
+        .await;
 
         if let Ok(row) = db_id_res {
             let file_db_id: i64 = row.get("id");
-            if let Ok(art_id) = ensure_ai_artifact(&*self.evidence_pool, self.evidence_id, args.partition_id, file_db_id, "AI Database Analysis").await {
+            if let Ok(art_id) = ensure_ai_artifact(
+                &*self.evidence_pool,
+                self.evidence_id,
+                args.partition_id,
+                file_db_id,
+                "AI Database Analysis",
+            )
+            .await
+            {
                 let mut db_val = val.clone();
                 if let Some(obj) = db_val.as_object_mut() {
-                    obj.insert("schema_preview".to_string(), serde_json::json!(schema_trimmed));
+                    obj.insert(
+                        "schema_preview".to_string(),
+                        serde_json::json!(schema_trimmed),
+                    );
                 }
                 let _ = store_specialist_result(
-                    &*self.evidence_pool, self.evidence_id, args.partition_id, file_db_id, art_id, &file_name, "Database Analysis", Some(&schema_trimmed), &db_val
-                ).await;
+                    &*self.evidence_pool,
+                    self.evidence_id,
+                    args.partition_id,
+                    file_db_id,
+                    art_id,
+                    &file_name,
+                    "Database Analysis",
+                    Some(&schema_trimmed),
+                    &db_val,
+                )
+                .await;
             }
         }
 
-        let summary = val.get("summary").and_then(|s| s.as_str()).unwrap_or("No summary provided");
-        Ok(format!("Sqlite Specialist Analysis Complete for '{}'. Summary: {}", file_name, summary))
+        let summary = val
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or("No summary provided");
+        Ok(format!(
+            "Sqlite Specialist Analysis Complete for '{}'. Summary: {}",
+            file_name, summary
+        ))
     }
 }

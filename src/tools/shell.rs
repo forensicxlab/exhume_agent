@@ -1,9 +1,9 @@
+use crate::ui::UiHandle;
+use colored::Colorize;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
 use std::process::Command;
-use colored::Colorize;
 
 #[derive(Deserialize)]
 pub struct ShellArgs {
@@ -23,7 +23,15 @@ pub struct ShellOutput {
 pub struct ShellError(pub String);
 
 #[derive(Clone, Default)]
-pub struct ShellTool;
+pub struct ShellTool {
+    ui: Option<UiHandle>,
+}
+
+impl ShellTool {
+    pub fn new(ui: Option<UiHandle>) -> Self {
+        Self { ui }
+    }
+}
 
 impl Tool for ShellTool {
     const NAME: &'static str = "shell";
@@ -50,15 +58,34 @@ impl Tool for ShellTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("\n  {} {} {}", "⚠️".yellow(), "AGENT REQUESTS SHELL EXECUTION:".bold().yellow(), args.command.cyan());
-        print!("  Allow execution? (y/N): ");
-        io::stdout().flush().map_err(|e| ShellError(e.to_string()))?;
+        let allowed = if let Some(ui) = &self.ui {
+            ui.log(format!("Agent requested shell execution: {}", args.command));
+            ui.request_approval(format!("Allow shell execution?\n\n{}", args.command))
+                .await
+        } else {
+            println!(
+                "\n  {} {} {}",
+                "⚠️".yellow(),
+                "AGENT REQUESTS SHELL EXECUTION:".bold().yellow(),
+                args.command.cyan()
+            );
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| ShellError(e.to_string()))?;
+            input.trim().to_lowercase() == "y"
+        };
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(|e| ShellError(e.to_string()))?;
-
-        if input.trim().to_lowercase() != "y" {
-            println!("  {} {}", "❌".red(), "Execution denied by user.".bold().red());
+        if !allowed {
+            if let Some(ui) = &self.ui {
+                ui.log("Shell execution denied by user.");
+            } else {
+                println!(
+                    "  {} {}",
+                    "❌".red(),
+                    "Execution denied by user.".bold().red()
+                );
+            }
             return Ok(ShellOutput {
                 stdout: String::new(),
                 stderr: "Execution denied by user.".to_string(),
@@ -67,7 +94,11 @@ impl Tool for ShellTool {
             });
         }
 
-        println!("  {} {}...", "🚀".green(), "Executing".bold().green());
+        if let Some(ui) = &self.ui {
+            ui.log("Executing shell command...");
+        } else {
+            println!("  {} {}...", "🚀".green(), "Executing".bold().green());
+        }
 
         let command = args.command.clone();
         let output = tokio::task::spawn_blocking(move || {
@@ -77,10 +108,7 @@ impl Tool for ShellTool {
                     .arg(&command)
                     .output()
             } else {
-                Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .output()
+                Command::new("sh").arg("-c").arg(&command).output()
             }
         })
         .await

@@ -10,12 +10,13 @@ pub async fn ensure_ai_artifact(
     name: &str,
 ) -> Result<i64, sqlx::Error> {
     // Check if it already exists
-    let existing = sqlx::query("SELECT id FROM artifacts WHERE file_id = ? AND evidence_id = ? AND name = ?")
-        .bind(file_id)
-        .bind(evidence_id)
-        .bind(name)
-        .fetch_optional(pool)
-        .await?;
+    let existing =
+        sqlx::query("SELECT id FROM artifacts WHERE file_id = ? AND evidence_id = ? AND name = ?")
+            .bind(file_id)
+            .bind(evidence_id)
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
 
     if let Some(row) = existing {
         return Ok(row.get(0));
@@ -63,6 +64,9 @@ pub async fn store_specialist_result(
     .execute(pool)
     .await?;
 
-    info!("Saved specialist output '{}' for file '{}' into database.", kind, file_name);
+    info!(
+        "Saved specialist output '{}' for file '{}' into database.",
+        kind, file_name
+    );
     Ok(())
 }

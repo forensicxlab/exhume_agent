@@ -1,6 +1,9 @@
 use exhume_body::Body;
-use exhume_filesystem::detected_fs::{detect_filesystem, detect_filesystem_from_path, DetectedFs, ImageStream, KeyMaterial};
+use exhume_filesystem::detected_fs::{
+    detect_filesystem, detect_filesystem_from_path, DetectedFs, ImageStream, KeyMaterial,
+};
 use exhume_filesystem::Filesystem;
+use exhume_indexer::get_partition;
 use log::error;
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
@@ -12,56 +15,23 @@ pub struct EvidenceIOError(pub String);
 
 /// Resolve a partition's byte offset and size from the index database.
 ///
-/// Queries `mbr_partition_entries`, `gpt_partition_entries`, and
-/// `logical_partition_entries` in order. Returns `(first_byte_addr, size_bytes)`.
+/// Returns `(first_byte_addr, size_bytes)`.
 pub async fn resolve_partition(
     pool: &SqlitePool,
     partition_id: i64,
-    image_path: &str,
+    _image_path: &str,
 ) -> Result<(u64, u64), EvidenceIOError> {
-    let body = Body::new(image_path.to_string(), "auto");
-    let sector_size = body.get_sector_size() as u64;
-
-    if let Ok(row) = sqlx::query(
-        "SELECT first_byte_addr, size_sectors FROM mbr_partition_entries WHERE id = ?",
-    )
-    .bind(partition_id)
-    .fetch_one(pool)
-    .await
-    {
-        let addr = row.try_get::<i64, _>("first_byte_addr").unwrap_or(0) as u64;
-        let size = (row.try_get::<i64, _>("size_sectors").unwrap_or(0) as u64)
-            .saturating_mul(sector_size);
-        return Ok((addr, size));
-    }
-
-    if let Ok(row) = sqlx::query(
-        "SELECT first_byte_addr, size_sectors FROM gpt_partition_entries WHERE id = ?",
-    )
-    .bind(partition_id)
-    .fetch_one(pool)
-    .await
-    {
-        let addr = row.try_get::<i64, _>("first_byte_addr").unwrap_or(0) as u64;
-        let size = (row.try_get::<i64, _>("size_sectors").unwrap_or(0) as u64)
-            .saturating_mul(sector_size);
-        return Ok((addr, size));
-    }
-
-    if let Ok(row) = sqlx::query(
-        "SELECT first_byte_addr, size FROM logical_partition_entries WHERE id = ?",
-    )
-    .bind(partition_id)
-    .fetch_one(pool)
-    .await
-    {
-        let addr = row.try_get::<i64, _>("first_byte_addr").unwrap_or(0) as u64;
-        let size = row.try_get::<i64, _>("size").unwrap_or(0) as u64;
-        return Ok((addr, size));
+    if let Some(partition) = get_partition(pool, partition_id).await.map_err(|e| {
+        EvidenceIOError(format!(
+            "Failed to resolve partition {}: {}",
+            partition_id, e
+        ))
+    })? {
+        return Ok((partition.first_byte_addr, partition.size_bytes));
     }
 
     Err(EvidenceIOError(format!(
-        "Partition ID {} not found in any partition table",
+        "Partition ID {} not found in partitions table",
         partition_id
     )))
 }
@@ -81,17 +51,11 @@ pub async fn open_filesystem(
     let (offset, size) = resolve_partition(pool, partition_id, image_path).await?;
 
     // Look up optional FVEK
-    let fvek_hex: Option<String> = sqlx::query_scalar(
-        "SELECT fvek FROM mbr_partition_entries WHERE id = ? \
-         UNION SELECT fvek FROM gpt_partition_entries WHERE id = ? \
-         UNION SELECT fvek FROM logical_partition_entries WHERE id = ? LIMIT 1",
-    )
-    .bind(partition_id)
-    .bind(partition_id)
-    .bind(partition_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
+    let fvek_hex = get_partition(pool, partition_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|partition| partition.fvek);
 
     let key_material = fvek_hex
         .and_then(|h| hex::decode(h).ok())
@@ -140,9 +104,8 @@ pub async fn extract_file_bytes(
             EvidenceIOError(format!("File lookup failed for id {}: {}", file_id, e))
         })?;
 
-        fs.read_file_content(&file).map_err(|e| {
-            EvidenceIOError(format!("Failed to read file bytes: {}", e))
-        })?
+        fs.read_file_content(&file)
+            .map_err(|e| EvidenceIOError(format!("Failed to read file bytes: {}", e)))?
     };
 
     // Persistent dump to host
