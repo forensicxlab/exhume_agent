@@ -138,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
     println!("{} {}", "LLM Provider:".bold(), config.provider);
     println!("{} {}", "LLM Model:".bold(), config.model);
 
+    let provider = config.provider.clone();
+    let model = config.model.clone();
+
     // Initialize Index
     let pool = match index::init_index(&target_path, &db_path, is_folder, args.logical).await {
         Ok(p) => p,
@@ -210,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
         "===============================================\n".blue()
     );
 
-    tui::run(agent, pool, report_mode, ui_rx).await?;
+    tui::run(agent, pool, report_mode, ui_rx, target_path, provider, model).await?;
 
     Ok(())
 }

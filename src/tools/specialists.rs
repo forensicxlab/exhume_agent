@@ -4,7 +4,7 @@ use crate::evidence_io::extract_file_bytes;
 use crate::ui::UiHandle;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use colored::Colorize;
-use log::{debug, error};
+use log::debug;
 use rig::client::CompletionClient;
 use rig::completion::{Prompt, ToolDefinition};
 use rig::providers::{ollama, openai};
@@ -280,6 +280,37 @@ impl Tool for DelegateImageSpecialist {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Return cached result if this file was already analyzed in a prior session
+        if let Ok(Some(cached)) = sqlx::query(
+            r#"SELECT sf.name, ao.text
+               FROM artifact_objects ao
+               JOIN system_files sf ON sf.id = ao.file_id
+               WHERE sf.identifier = ? AND sf.partition_id = ?
+                 AND ao.parser = 'ai_specialist' AND ao.kind = 'Image Analysis'
+               LIMIT 1"#,
+        )
+        .bind(args.file_id as i64)
+        .bind(args.partition_id)
+        .fetch_optional(&*self.evidence_pool)
+        .await
+        {
+            let name: String = cached.try_get("name").unwrap_or_default();
+            let summary: String = cached.try_get("text").unwrap_or_default();
+            if let Some(ui) = &self.ui {
+                ui.log(format!("Image Specialist: returning cached result for '{name}'"));
+            } else {
+                println!(
+                    "  {} {} '{}' (cached)",
+                    "🛠️".magenta(),
+                    "Image Specialist —".bold(),
+                    name
+                );
+            }
+            return Ok(format!(
+                "[CACHED] Image Specialist Analysis for '{name}'. Summary: {summary}"
+            ));
+        }
+
         if let Some(ui) = &self.ui {
             ui.log(format!(
                 "Delegating file_id={} to Image Specialist...",
@@ -478,6 +509,37 @@ impl Tool for DelegateAudioSpecialist {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Return cached result if this file was already analyzed in a prior session
+        if let Ok(Some(cached)) = sqlx::query(
+            r#"SELECT sf.name, ao.text
+               FROM artifact_objects ao
+               JOIN system_files sf ON sf.id = ao.file_id
+               WHERE sf.identifier = ? AND sf.partition_id = ?
+                 AND ao.parser = 'ai_specialist' AND ao.kind = 'Audio Analysis'
+               LIMIT 1"#,
+        )
+        .bind(args.file_id as i64)
+        .bind(args.partition_id)
+        .fetch_optional(&*self.evidence_pool)
+        .await
+        {
+            let name: String = cached.try_get("name").unwrap_or_default();
+            let summary: String = cached.try_get("text").unwrap_or_default();
+            if let Some(ui) = &self.ui {
+                ui.log(format!("Audio Specialist: returning cached result for '{name}'"));
+            } else {
+                println!(
+                    "  {} {} '{}' (cached)",
+                    "🛠️".magenta(),
+                    "Audio Specialist —".bold(),
+                    name
+                );
+            }
+            return Ok(format!(
+                "[CACHED] Audio Specialist Analysis for '{name}'. Summary: {summary}"
+            ));
+        }
+
         if let Some(ui) = &self.ui {
             ui.log(format!(
                 "Delegating file_id={} to Audio Specialist...",
@@ -729,6 +791,37 @@ impl Tool for DelegateSqliteSpecialist {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Return cached result if this file was already analyzed in a prior session
+        if let Ok(Some(cached)) = sqlx::query(
+            r#"SELECT sf.name, ao.text
+               FROM artifact_objects ao
+               JOIN system_files sf ON sf.id = ao.file_id
+               WHERE sf.identifier = ? AND sf.partition_id = ?
+                 AND ao.parser = 'ai_specialist' AND ao.kind = 'Database Analysis'
+               LIMIT 1"#,
+        )
+        .bind(args.file_id as i64)
+        .bind(args.partition_id)
+        .fetch_optional(&*self.evidence_pool)
+        .await
+        {
+            let name: String = cached.try_get("name").unwrap_or_default();
+            let summary: String = cached.try_get("text").unwrap_or_default();
+            if let Some(ui) = &self.ui {
+                ui.log(format!("SQLite Specialist: returning cached result for '{name}'"));
+            } else {
+                println!(
+                    "  {} {} '{}' (cached)",
+                    "🛠️".magenta(),
+                    "SQLite Specialist —".bold(),
+                    name
+                );
+            }
+            return Ok(format!(
+                "[CACHED] Sqlite Specialist Analysis for '{name}'. Summary: {summary}"
+            ));
+        }
+
         if let Some(ui) = &self.ui {
             ui.log(format!(
                 "Delegating file_id={} to SQLite Specialist...",

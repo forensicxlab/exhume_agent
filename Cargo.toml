@@ -1,3 +1,17 @@
+[workspace]
+
+[patch.crates-io]
+exhume_artefacts  = { path = "../exhume_artefacts" }
+exhume_body       = { path = "../exhume_body" }
+exhume_filesystem = { path = "../exhume_filesystem" }
+exhume_partitions = { path = "../exhume_partitions" }
+exhume_extfs      = { path = "../exhume_extfs" }
+exhume_exfat      = { path = "../exhume_exfat" }
+exhume_lvm        = { path = "../exhume_lvm" }
+exhume_ntfs       = { path = "../exhume_ntfs" }
+exhume_apfs       = { path = "../exhume_apfs" }
+exhume_indexer    = { path = "../exhume_indexer" }
+
 [package]
 name = "exhume_agent"
 version = "0.1.1"
@@ -55,3 +69,6 @@ base64 = "0.22.1"
 log = "0.4.29"
 indicatif = "0.17"
 prettytable-rs = { version = "0.10", features = ["win_crlf"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
