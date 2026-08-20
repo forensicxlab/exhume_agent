@@ -1,5 +1,4 @@
 use crate::ui::UiHandle;
-use colored::Colorize;
 use exhume_body::Body;
 use exhume_partitions::Partitions;
 use rig::completion::ToolDefinition;
@@ -63,7 +62,7 @@ impl Tool for ListPartitionsTool {
         if let Some(ui) = &self.ui {
             ui.log("Listing partitions...");
         } else {
-            println!("  {} {}...", "🛠️".magenta(), "Listing partitions".bold());
+            tracing::info!("Listing partitions");
         }
         let mut body = Body::new(self.image_path.clone(), "auto");
 

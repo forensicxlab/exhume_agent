@@ -8,6 +8,12 @@ pub struct AgentConfig {
     pub model: String,
     pub endpoint: String,
     pub api_key: String,
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+    #[serde(default)]
+    pub image_endpoint: Option<String>,
+    #[serde(default)]
+    pub audio_endpoint: Option<String>,
 }
 
 impl AgentConfig {
@@ -46,6 +52,9 @@ impl AgentConfig {
 
         let api_key = env::var("AGENT_API_KEY")
             .unwrap_or_else(|_| env::var("OPENAI_API_KEY").unwrap_or_default());
+        let llm_endpoint = env::var("AGENT_LLM_ENDPOINT").ok();
+        let image_endpoint = env::var("AGENT_IMAGE_ENDPOINT").ok();
+        let audio_endpoint = env::var("AGENT_AUDIO_ENDPOINT").ok();
 
         if provider == "openai" && api_key.is_empty() {
             anyhow::bail!("OpenAI API key is missing. Set AGENT_API_KEY or OPENAI_API_KEY environment variable.");
@@ -66,6 +75,56 @@ impl AgentConfig {
             model,
             endpoint,
             api_key,
+            llm_endpoint,
+            image_endpoint,
+            audio_endpoint,
         })
+    }
+
+    pub fn openai_endpoint(&self) -> Option<String> {
+        self.llm_endpoint
+            .clone()
+            .or_else(|| (!self.endpoint.trim().is_empty()).then(|| self.endpoint.clone()))
+    }
+
+    pub fn copilot_llm_endpoint(&self) -> Result<String> {
+        self.service_endpoint(self.llm_endpoint.as_deref(), 8000, "/v1")
+    }
+
+    pub fn copilot_image_endpoint(&self) -> Result<String> {
+        self.service_endpoint(self.image_endpoint.as_deref(), 8001, "/v1/describe")
+    }
+
+    pub fn copilot_audio_endpoint(&self) -> Result<String> {
+        self.service_endpoint(self.audio_endpoint.as_deref(), 8002, "/v1/transcribe")
+    }
+
+    fn service_endpoint(
+        &self,
+        explicit: Option<&str>,
+        default_port: u16,
+        default_path: &str,
+    ) -> Result<String> {
+        if let Some(explicit) = explicit.filter(|value| !value.trim().is_empty()) {
+            return Ok(normalize_endpoint(explicit));
+        }
+
+        let mut url = reqwest::Url::parse(&normalize_endpoint(&self.endpoint))
+            .map_err(|error| anyhow::anyhow!("Invalid agent endpoint: {error}"))?;
+        url.set_port(Some(default_port))
+            .map_err(|_| anyhow::anyhow!("Agent endpoint cannot accept a port"))?;
+        url.set_path(default_path);
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(url.to_string().trim_end_matches('/').to_string())
+    }
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
     }
 }

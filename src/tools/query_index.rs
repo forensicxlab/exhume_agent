@@ -1,37 +1,29 @@
+use crate::policy::AgentPolicy;
 use crate::ui::UiHandle;
-use prettytable::{format, Cell, Row, Table};
+use futures_util::TryStreamExt;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
-use sqlx::{Column, Row as SqlRow, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::{Column, Row, SqlitePool};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::OnceCell;
 
-/// Hard cap for the terminal display.
-const TERMINAL_MAX_ROWS: usize = 100;
-/// Default number of rows returned to the LLM context (lower = fewer tokens).
 const LLM_DEFAULT_MAX_ROWS: usize = 50;
-/// Absolute ceiling the caller may request for LLM rows.
-const LLM_HARD_MAX_ROWS: usize = 200;
-
-/// Columns that are printed for the human investigator but excluded from the LLM's context
-/// because they contain large binary / raw data that consumes tokens without adding reasoning value.
 const LLM_EXCLUDED_COLS: &[&str] = &["metadata", "display"];
-
-/// Maximum characters per cell value returned to the LLM. Values beyond this are truncated.
-const LLM_MAX_CELL: usize = 300;
+const LLM_MAX_CELL_CHARS: usize = 300;
 
 #[derive(Deserialize)]
 pub struct QueryIndexArgs {
     pub sql: String,
-    /// Maximum rows to return in the LLM context (1–200, default 50).
-    /// Use a small value (e.g. 5) when you only need a sample.
-    /// Use `SELECT COUNT(*)` queries first to gauge scale before fetching rows.
     pub max_rows: Option<usize>,
 }
 
 #[derive(Serialize)]
 pub struct QueryIndexOutput {
-    /// Compact text table returned to the LLM (prettytable format).
     pub result: String,
     pub row_count: usize,
     pub truncated: bool,
@@ -44,13 +36,38 @@ pub struct QueryIndexError(pub String);
 
 #[derive(Clone)]
 pub struct QueryIndexTool {
-    pool: Arc<SqlitePool>,
+    db_path: PathBuf,
+    pool: Arc<OnceCell<SqlitePool>>,
     ui: Option<UiHandle>,
+    policy: AgentPolicy,
 }
 
 impl QueryIndexTool {
-    pub fn new(pool: Arc<SqlitePool>, ui: Option<UiHandle>) -> Self {
-        Self { pool, ui }
+    pub fn new(db_path: PathBuf, ui: Option<UiHandle>, policy: AgentPolicy) -> Self {
+        Self {
+            db_path,
+            pool: Arc::new(OnceCell::new()),
+            ui,
+            policy,
+        }
+    }
+
+    async fn read_pool(&self) -> Result<&SqlitePool, QueryIndexError> {
+        self.pool
+            .get_or_try_init(|| async {
+                let url = format!("sqlite:{}", self.db_path.display());
+                let options = SqliteConnectOptions::from_str(&url)
+                    .map_err(|error| QueryIndexError(error.to_string()))?
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .busy_timeout(Duration::from_secs(self.policy.query_timeout_secs.max(1)));
+                SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(options)
+                    .await
+                    .map_err(|error| QueryIndexError(error.to_string()))
+            })
+            .await
     }
 }
 
@@ -64,33 +81,25 @@ impl Tool for QueryIndexTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Execute a read-only SQL query against the local SQLite forensic index.
-            Tables:
-            - `system_files`: [id, evidence_id, partition_id, identifier (file_id), absolute_path (logical forensic path), host_path (real host path — use for shell commands; NULL for disk images), name, ftype, size, created, modified, accessed, sig_name, sig_mime, sig_exts, anomaly_flag, metadata, display]
-            - `artifacts`: [id, file_id, name, description, parser, tag, category]
-            - `artifact_objects`: [id, artifact_id, file_id, parser, kind, text, json]
-            - `partitions`: [id, evidence_id, kind, first_byte_addr, size_sectors, sector_size, size_bytes, fvek, description]
-            - `investigation_notes`: [id, file_id, path, note, significance, created_at]
-            Views:
-            - `timeline`: unified filesystem timestamps — columns: [evidence_id, partition_id, row_id, identifier, absolute_path, name, sig_name, anomaly_flag, event_type ('created'|'modified'|'accessed'), event_time (ISO string), ts_unix (integer)]
-            Token-saving tips:
-            - Use `SELECT COUNT(*) FROM ...` first to gauge result size before fetching rows.
-            - Use `anomaly_flag = 1` in WHERE clauses to jump straight to signature-mismatch anomalies.
-            - Query `artifact_objects WHERE parser = 'ai_specialist'` to retrieve cached specialist results rather than re-running specialists.
-            - Use the `max_rows` parameter (default 50) to control how many rows appear in your context.
-            Results are rendered as a table on the terminal; a slim version is returned in your context.".to_string(),
+            description: "Execute one read-only SQL query against the local SQLite forensic index. \
+                Use COUNT queries before broad result queries and add WHERE/LIMIT clauses. \
+                Primary tables are system_files, partitions, artifacts, artifact_objects, and investigation_notes."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "sql": {
                         "type": "string",
-                        "description": "The SQL SELECT statement to execute."
+                        "description": "One SELECT, WITH ... SELECT, or EXPLAIN SELECT statement."
                     },
                     "max_rows": {
                         "type": "integer",
-                        "description": "Max rows returned in your context (1–200, default 50). Use small values for sampling.",
+                        "description": format!(
+                            "Maximum rows returned, capped at {}.",
+                            self.policy.max_query_rows
+                        ),
                         "minimum": 1,
-                        "maximum": 200
+                        "maximum": self.policy.max_query_rows
                     }
                 },
                 "required": ["sql"]
@@ -99,189 +108,300 @@ impl Tool for QueryIndexTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        use colored::Colorize;
+        let sql = match validate_read_query(&args.sql) {
+            Ok(sql) => sql,
+            Err(error) => return Ok(error_output(error)),
+        };
+
         if let Some(ui) = &self.ui {
-            ui.log(format!("Querying file index: {}", args.sql));
+            ui.log(format!("Querying forensic index: {sql}"));
         } else {
-            println!(
-                "  {} {} SQL: {}",
-                "🛠️".magenta(),
-                "Querying file index —".bold(),
-                args.sql.dimmed()
-            );
+            tracing::info!(query = %sql, "Querying forensic index");
         }
 
-        let sql = args.sql.trim();
-        if !sql.to_uppercase().starts_with("SELECT") {
+        let limit = args
+            .max_rows
+            .unwrap_or(LLM_DEFAULT_MAX_ROWS)
+            .clamp(1, self.policy.max_query_rows.max(1));
+        let timeout = Duration::from_secs(self.policy.query_timeout_secs.max(1));
+        let pool = self.read_pool().await?;
+
+        let fetch = async {
+            let mut stream = sqlx::query(&sql).fetch(pool);
+            let mut rows = Vec::with_capacity(limit.saturating_add(1));
+            while rows.len() <= limit {
+                match stream.try_next().await {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => break,
+                    Err(error) => return Err(QueryIndexError(error.to_string())),
+                }
+            }
+            Ok::<_, QueryIndexError>(rows)
+        };
+
+        let mut rows = match tokio::time::timeout(timeout, fetch).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => return Ok(error_output(error.to_string())),
+            Err(_) => {
+                return Ok(error_output(format!(
+                    "Query exceeded the {} second timeout",
+                    timeout.as_secs()
+                )))
+            }
+        };
+
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        if rows.is_empty() {
             return Ok(QueryIndexOutput {
-                result: String::new(),
+                result: "Query returned 0 rows.".to_string(),
                 row_count: 0,
                 truncated: false,
-                error: Some("Only SELECT queries are allowed.".to_string()),
+                error: None,
             });
         }
 
-        let rows_res = sqlx::query(sql).fetch_all(&*self.pool).await;
+        let columns: Vec<String> = rows[0]
+            .columns()
+            .iter()
+            .map(|column| column.name().to_string())
+            .filter(|name| !LLM_EXCLUDED_COLS.contains(&name.as_str()))
+            .collect();
+        let table = render_markdown_table(&rows, &columns);
+        let truncation_note = truncated.then(|| {
+            format!(
+                "\n[RESULT CAPPED: showing the first {limit} rows. Refine the query to inspect more.]"
+            )
+        });
+        let result = format!(
+            "{} row(s) returned. Columns: [{}]\n\n{}{}",
+            rows.len(),
+            columns.join(", "),
+            table,
+            truncation_note.unwrap_or_default()
+        );
 
-        match rows_res {
-            Ok(sql_rows) => {
-                if sql_rows.is_empty() {
-                    if let Some(ui) = &self.ui {
-                        ui.log("Query returned 0 rows.");
-                    } else {
-                        println!("  {} No rows returned.\n", "📋".cyan());
-                    }
-                    return Ok(QueryIndexOutput {
-                        result: "Query returned 0 rows.".to_string(),
-                        row_count: 0,
-                        truncated: false,
-                        error: None,
-                    });
-                }
-
-                let total_rows = sql_rows.len();
-
-                let llm_limit = args
-                    .max_rows
-                    .unwrap_or(LLM_DEFAULT_MAX_ROWS)
-                    .clamp(1, LLM_HARD_MAX_ROWS);
-                let terminal_limit = TERMINAL_MAX_ROWS;
-
-                let terminal_rows = &sql_rows[..total_rows.min(terminal_limit)];
-                let llm_rows = &sql_rows[..total_rows.min(llm_limit)];
-                let is_truncated = total_rows > llm_limit;
-
-                // Collect column names from the first row
-                let col_names: Vec<String> = sql_rows[0]
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
-
-                // ── Helper: read one cell as a String ────────────────────
-                let read_cell = |row: &sqlx::sqlite::SqliteRow, col: &str| -> String {
-                    if let Ok(v) = row.try_get::<String, _>(col) {
-                        v
-                    } else if let Ok(v) = row.try_get::<i64, _>(col) {
-                        v.to_string()
-                    } else if let Ok(v) = row.try_get::<f64, _>(col) {
-                        v.to_string()
-                    } else if let Ok(v) = row.try_get::<bool, _>(col) {
-                        v.to_string()
-                    } else {
-                        "NULL".to_string()
-                    }
-                };
-
-                // ── Full table printed to the terminal (all columns, capped at TERMINAL_MAX_ROWS) ──
-                let mut full_table = Table::new();
-                full_table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-                full_table.set_titles(Row::new(
-                    col_names.iter().map(|n| Cell::new(n).style_spec("bFc")).collect(),
-                ));
-                for row in terminal_rows {
-                    full_table.add_row(Row::new(
-                        col_names.iter().map(|c| Cell::new(&read_cell(row, c))).collect(),
-                    ));
-                }
-
-                if let Some(ui) = &self.ui {
-                    ui.log(full_table.to_string());
-                    if total_rows > terminal_limit {
-                        ui.log(format!(
-                            "Showing {} of {} total rows. Use LIMIT/WHERE to refine.",
-                            terminal_limit, total_rows
-                        ));
-                    } else {
-                        ui.log(format!("{} row(s) returned.", total_rows));
-                    }
-                } else {
-                    println!();
-                    full_table.printstd();
-                    if total_rows > terminal_limit {
-                        println!(
-                            "  {} Showing {} of {} total rows. Use LIMIT/WHERE to refine.\n",
-                            "⚠️".yellow(),
-                            terminal_limit.to_string().bold(),
-                            total_rows.to_string().bold()
-                        );
-                    } else {
-                        println!(
-                            "  {} {} row(s) returned.\n",
-                            "📋".cyan(),
-                            total_rows.to_string().bold()
-                        );
-                    }
-                }
-
-                // ── Slim table returned to the LLM (heavy columns stripped, values capped, fewer rows) ──
-                let llm_cols: Vec<&String> = col_names
-                    .iter()
-                    .filter(|n| !LLM_EXCLUDED_COLS.contains(&n.as_str()))
-                    .collect();
-
-                let mut llm_table = Table::new();
-                llm_table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-                llm_table.set_titles(Row::new(
-                    llm_cols.iter().map(|n| Cell::new(n).style_spec("bFc")).collect(),
-                ));
-                for row in llm_rows {
-                    llm_table.add_row(Row::new(
-                        llm_cols
-                            .iter()
-                            .map(|c| {
-                                let val = read_cell(row, c);
-                                let truncated = if val.len() > LLM_MAX_CELL {
-                                    format!("{}…", &val[..LLM_MAX_CELL])
-                                } else {
-                                    val
-                                };
-                                Cell::new(&truncated)
-                            })
-                            .collect(),
-                    ));
-                }
-
-                let excluded_note = if !LLM_EXCLUDED_COLS.iter().all(|e| !col_names.iter().any(|c| c == e)) {
-                    let present: Vec<&str> = LLM_EXCLUDED_COLS
-                        .iter()
-                        .filter(|e| col_names.iter().any(|c| c.as_str() == **e))
-                        .copied()
-                        .collect();
-                    format!(" (columns omitted from context: {})", present.join(", "))
-                } else {
-                    String::new()
-                };
-
-                let truncation_note = if is_truncated {
-                    format!(
-                        "\n[CONTEXT TRUNCATED: showing {} of {} rows — use max_rows or add LIMIT/WHERE to adjust.]",
-                        llm_limit, total_rows
-                    )
-                } else {
-                    String::new()
-                };
-
-                Ok(QueryIndexOutput {
-                    result: format!(
-                        "{} row(s) returned. Columns: [{}]{}\n\n{}{}",
-                        total_rows,
-                        llm_cols.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
-                        excluded_note,
-                        llm_table.to_string(),
-                        truncation_note
-                    ),
-                    row_count: total_rows,
-                    truncated: is_truncated,
-                    error: None,
-                })
-            }
-            Err(e) => Ok(QueryIndexOutput {
-                result: String::new(),
-                row_count: 0,
-                truncated: false,
-                error: Some(e.to_string()),
-            }),
+        if let Some(ui) = &self.ui {
+            ui.log(result.clone());
         }
+
+        Ok(QueryIndexOutput {
+            result,
+            row_count: rows.len(),
+            truncated,
+            error: None,
+        })
+    }
+}
+
+pub fn validate_read_query(sql: &str) -> Result<String, String> {
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Err("SQL query cannot be empty.".to_string());
+    }
+    if contains_multiple_statements(sql) {
+        return Err("Only one SQL statement is allowed.".to_string());
+    }
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim().to_string();
+    let tokens = unquoted_sql_tokens(&sql);
+    let first = tokens.first().map(String::as_str).unwrap_or_default();
+    if !matches!(first, "SELECT" | "WITH" | "EXPLAIN") {
+        return Err(
+            "Only SELECT, WITH ... SELECT, or EXPLAIN SELECT queries are allowed.".to_string(),
+        );
+    }
+    const WRITE_TOKENS: &[&str] = &[
+        "ALTER", "ATTACH", "CREATE", "DELETE", "DETACH", "DROP", "INSERT", "PRAGMA", "REINDEX",
+        "REPLACE", "UPDATE", "VACUUM",
+    ];
+    if let Some(token) = tokens
+        .iter()
+        .find(|token| WRITE_TOKENS.contains(&token.as_str()))
+    {
+        return Err(format!(
+            "SQL token '{token}' is not allowed in a read-only query."
+        ));
+    }
+    Ok(sql)
+}
+
+fn unquoted_sql_tokens(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(character) = chars.next() {
+        if let Some(current_quote) = quote {
+            if character == current_quote {
+                if chars.peek() == Some(&current_quote) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            push_token(&mut tokens, &mut token);
+            quote = Some(character);
+            continue;
+        }
+        if character == '-' && chars.peek() == Some(&'-') {
+            push_token(&mut tokens, &mut token);
+            chars.next();
+            for comment_character in chars.by_ref() {
+                if comment_character == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'*') {
+            push_token(&mut tokens, &mut token);
+            chars.next();
+            let mut previous = '\0';
+            for comment_character in chars.by_ref() {
+                if previous == '*' && comment_character == '/' {
+                    break;
+                }
+                previous = comment_character;
+            }
+            continue;
+        }
+        if character.is_ascii_alphanumeric() || character == '_' {
+            token.push(character.to_ascii_uppercase());
+        } else {
+            push_token(&mut tokens, &mut token);
+        }
+    }
+    push_token(&mut tokens, &mut token);
+    tokens
+}
+
+fn push_token(tokens: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        tokens.push(std::mem::take(token));
+    }
+}
+
+fn contains_multiple_statements(sql: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut semicolons = Vec::new();
+    for (index, ch) in sql.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if let Some(current) = quote {
+            if ch == current {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+        } else if ch == ';' {
+            semicolons.push(index);
+        }
+    }
+    semicolons
+        .iter()
+        .any(|index| !sql[index + 1..].trim().is_empty())
+}
+
+fn render_markdown_table(rows: &[SqliteRow], columns: &[String]) -> String {
+    let mut output = String::new();
+    output.push('|');
+    for column in columns {
+        output.push(' ');
+        output.push_str(&escape_markdown(column));
+        output.push_str(" |");
+    }
+    output.push('\n');
+    output.push('|');
+    for _ in columns {
+        output.push_str(" --- |");
+    }
+    output.push('\n');
+    for row in rows {
+        output.push('|');
+        for column in columns {
+            output.push(' ');
+            output.push_str(&escape_markdown(&read_cell(row, column)));
+            output.push_str(" |");
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn read_cell(row: &SqliteRow, column: &str) -> String {
+    let value = if let Ok(value) = row.try_get::<String, _>(column) {
+        value
+    } else if let Ok(value) = row.try_get::<i64, _>(column) {
+        value.to_string()
+    } else if let Ok(value) = row.try_get::<f64, _>(column) {
+        value.to_string()
+    } else if let Ok(value) = row.try_get::<bool, _>(column) {
+        value.to_string()
+    } else if let Ok(value) = row.try_get::<Vec<u8>, _>(column) {
+        format!("<{} bytes>", value.len())
+    } else {
+        "NULL".to_string()
+    };
+    truncate_chars(&value, LLM_MAX_CELL_CHARS)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut result: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
+fn escape_markdown(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+fn error_output(error: impl Into<String>) -> QueryIndexOutput {
+    QueryIndexOutput {
+        result: String::new(),
+        row_count: 0,
+        truncated: false,
+        error: Some(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_multiple_statements, truncate_chars, validate_read_query};
+
+    #[test]
+    fn allows_single_read_queries() {
+        assert!(validate_read_query("SELECT * FROM system_files;").is_ok());
+        assert!(validate_read_query("WITH recent AS (SELECT 1) SELECT * FROM recent").is_ok());
+    }
+
+    #[test]
+    fn rejects_multiple_or_write_queries() {
+        assert!(contains_multiple_statements(
+            "SELECT 1; DELETE FROM system_files"
+        ));
+        assert!(validate_read_query("DELETE FROM system_files").is_err());
+        assert!(validate_read_query("WITH doomed AS (SELECT 1) DELETE FROM system_files").is_err());
+        assert!(validate_read_query("SELECT ';' AS value;").is_ok());
+        assert!(validate_read_query("SELECT 'DELETE' AS harmless").is_ok());
+    }
+
+    #[test]
+    fn truncates_unicode_at_character_boundaries() {
+        assert_eq!(truncate_chars("évidence", 3), "évi…");
     }
 }

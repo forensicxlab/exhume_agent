@@ -1,6 +1,6 @@
-use crate::agent::ExhumeAgent;
 use crate::report::ReportMode;
-use crate::ui::{ApprovalRequest, UiEvent};
+use crate::session::AgentSession;
+use crate::ui::{AgentEventPayload, ApprovalRequest, SpecialistKind, SpecialistUpdate, UiEvent};
 use anyhow::Result;
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
 use rig::message::Message;
@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 const PANE_MIN: u16 = 20;
 const PANE_MAX: u16 = 80;
+const TAB_COUNT: usize = 4; // ALL + one per specialist
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -59,15 +60,82 @@ enum Cmd {
     Submit,
 }
 
+/// A scrollable log buffer with follow-bottom behavior.
+struct LogPane {
+    lines: Vec<String>,
+    scroll: u16,
+    auto_scroll: bool,
+}
+
+impl LogPane {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            scroll: 0,
+            auto_scroll: true,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        self.lines.push(line);
+        if self.auto_scroll {
+            self.scroll = u16::MAX;
+        }
+    }
+}
+
+enum SpecStatus {
+    Idle,
+    Running(String), // current stage text
+}
+
+/// One specialist sub-tab: its log pane plus live status for badges.
+struct SpecialistTab {
+    kind: SpecialistKind,
+    pane: LogPane,
+    status: SpecStatus,
+    done: usize,
+    failed: usize,
+}
+
+impl SpecialistTab {
+    fn new(kind: SpecialistKind) -> Self {
+        Self {
+            kind,
+            pane: LogPane::new(),
+            status: SpecStatus::Idle,
+            done: 0,
+            failed: 0,
+        }
+    }
+}
+
+fn spec_idx(kind: SpecialistKind) -> usize {
+    match kind {
+        SpecialistKind::Image => 0,
+        SpecialistKind::Audio => 1,
+        SpecialistKind::Sqlite => 2,
+    }
+}
+
+fn log_line_style(line: &str) -> Style {
+    match line.chars().next() {
+        Some('▶') => Style::default().fg(Color::Cyan),
+        Some('✓') => Style::default().fg(Color::Green),
+        Some('✗') => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
 // ── App state ──────────────────────────────────────────────────────────────
 
 struct App {
     messages: Vec<ChatMsg>,
     conv_scroll: u16,
 
-    tool_lines: Vec<String>,
-    tool_scroll: u16,
-    tool_auto_scroll: bool,
+    activity: LogPane,
+    specialists: [SpecialistTab; 3],
+    active_tab: usize, // 0 = ALL, 1..=3 = specialists
 
     input: String,
     input_cursor: usize,
@@ -89,14 +157,13 @@ struct App {
     anomaly_count: i64,
     report_enabled: bool,
 
-    history: Vec<Message>,
-    agent: ExhumeAgent,
+    session: AgentSession,
     pool: Arc<SqlitePool>,
 }
 
 impl App {
     fn new(
-        agent: ExhumeAgent,
+        session: AgentSession,
         pool: Arc<SqlitePool>,
         history: Vec<Message>,
         evidence_label: String,
@@ -125,9 +192,13 @@ impl App {
         Self {
             messages,
             conv_scroll: u16::MAX,
-            tool_lines: Vec::new(),
-            tool_scroll: 0,
-            tool_auto_scroll: true,
+            activity: LogPane::new(),
+            specialists: [
+                SpecialistTab::new(SpecialistKind::Image),
+                SpecialistTab::new(SpecialistKind::Audio),
+                SpecialistTab::new(SpecialistKind::Sqlite),
+            ],
+            active_tab: 0,
             input: String::new(),
             input_cursor: 0,
             pane_split: 62,
@@ -142,8 +213,7 @@ impl App {
             notes_count,
             anomaly_count,
             report_enabled,
-            history,
-            agent,
+            session,
             pool,
         }
     }
@@ -223,8 +293,9 @@ impl App {
                 match self.focus {
                     Focus::Conv => self.conv_scroll = self.conv_scroll.saturating_sub(1),
                     Focus::Tool => {
-                        self.tool_scroll = self.tool_scroll.saturating_sub(1);
-                        self.tool_auto_scroll = false;
+                        let pane = self.active_pane_mut();
+                        pane.scroll = pane.scroll.saturating_sub(1);
+                        pane.auto_scroll = false;
                     }
                     Focus::Input => {}
                 }
@@ -233,7 +304,10 @@ impl App {
             KeyCode::Down => {
                 match self.focus {
                     Focus::Conv => self.conv_scroll = self.conv_scroll.saturating_add(1),
-                    Focus::Tool => self.tool_scroll = self.tool_scroll.saturating_add(1),
+                    Focus::Tool => {
+                        let pane = self.active_pane_mut();
+                        pane.scroll = pane.scroll.saturating_add(1);
+                    }
                     Focus::Input => {}
                 }
                 Cmd::None
@@ -242,8 +316,9 @@ impl App {
                 match self.focus {
                     Focus::Conv => self.conv_scroll = self.conv_scroll.saturating_sub(10),
                     Focus::Tool => {
-                        self.tool_scroll = self.tool_scroll.saturating_sub(10);
-                        self.tool_auto_scroll = false;
+                        let pane = self.active_pane_mut();
+                        pane.scroll = pane.scroll.saturating_sub(10);
+                        pane.auto_scroll = false;
                     }
                     Focus::Input => {}
                 }
@@ -252,7 +327,10 @@ impl App {
             KeyCode::PageDown => {
                 match self.focus {
                     Focus::Conv => self.conv_scroll = self.conv_scroll.saturating_add(10),
-                    Focus::Tool => self.tool_scroll = self.tool_scroll.saturating_add(10),
+                    Focus::Tool => {
+                        let pane = self.active_pane_mut();
+                        pane.scroll = pane.scroll.saturating_add(10);
+                    }
                     Focus::Input => {}
                 }
                 Cmd::None
@@ -266,9 +344,23 @@ impl App {
             KeyCode::End => {
                 match self.focus {
                     Focus::Input => self.input_cursor = self.input.len(),
-                    Focus::Tool => self.tool_auto_scroll = true,
+                    Focus::Tool => self.active_pane_mut().auto_scroll = true,
                     _ => {}
                 }
+                Cmd::None
+            }
+
+            // Sub-tab switching in the activity pane
+            KeyCode::Left if self.focus == Focus::Tool => {
+                self.active_tab = self.active_tab.checked_sub(1).unwrap_or(TAB_COUNT - 1);
+                Cmd::None
+            }
+            KeyCode::Right if self.focus == Focus::Tool => {
+                self.active_tab = (self.active_tab + 1) % TAB_COUNT;
+                Cmd::None
+            }
+            KeyCode::Char(c @ '1'..='4') if self.focus == Focus::Tool => {
+                self.active_tab = (c as u8 - b'1') as usize;
                 Cmd::None
             }
 
@@ -334,13 +426,45 @@ impl App {
 
     fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Log(line) => self.push_tool(line),
-            UiEvent::ApprovalRequest(req) => {
-                self.pending_approval = Some(req);
-            }
-            UiEvent::ReportUpdated => {
-                self.push_tool("  Report updated and saved to disk.".into());
-            }
+            UiEvent::ApprovalRequest { request, .. } => self.pending_approval = Some(request),
+            UiEvent::Event(event) => match event.payload {
+                AgentEventPayload::Log { message, .. } => self.push_tool(message),
+                AgentEventPayload::Specialist { kind, update } => {
+                    self.push_specialist(kind, update)
+                }
+                AgentEventPayload::ToolCall {
+                    tool_name,
+                    arguments,
+                    ..
+                } => self.push_tool(format!("▶ {tool_name}: {arguments}")),
+                AgentEventPayload::ToolResult {
+                    tool_name, result, ..
+                } => self.push_tool(format!("✓ {tool_name}: {result}")),
+                AgentEventPayload::ApprovalResolved { approved, .. } => {
+                    self.push_tool(if approved {
+                        "  ✓ Approved.".into()
+                    } else {
+                        "  ✗ Denied.".into()
+                    });
+                }
+                AgentEventPayload::ReportUpdated { export_path } => {
+                    self.push_tool(match export_path {
+                        Some(path) => format!("  Report updated: {path}"),
+                        None => "  Report updated and saved to disk.".into(),
+                    });
+                }
+                AgentEventPayload::TurnStarted => {
+                    self.push_tool("Agent turn started.".into());
+                }
+                AgentEventPayload::TurnCancelled => {
+                    self.push_tool("Agent turn cancelled.".into());
+                }
+                AgentEventPayload::TurnFailed { error } => {
+                    self.push_tool(format!("Agent turn failed: {error}"));
+                }
+                AgentEventPayload::TurnCompleted { .. }
+                | AgentEventPayload::ApprovalRequested { .. } => {}
+            },
         }
     }
 
@@ -348,9 +472,6 @@ impl App {
         self.status = Status::Idle;
         match result {
             Ok(text) => {
-                let msg = Message::assistant(text.clone());
-                let _ = self.agent.save_message(&msg).await;
-                self.history.push(msg);
                 // Push an empty message slot and animate the text in
                 self.messages.push(ChatMsg {
                     role: Role::Agent,
@@ -369,10 +490,9 @@ impl App {
         self.conv_scroll = u16::MAX;
 
         // Refresh notes count
-        if let Ok(row) =
-            sqlx::query("SELECT COUNT(*) as cnt FROM investigation_notes")
-                .fetch_one(&*self.pool)
-                .await
+        if let Ok(row) = sqlx::query("SELECT COUNT(*) as cnt FROM investigation_notes")
+            .fetch_one(&*self.pool)
+            .await
         {
             use sqlx::Row;
             self.notes_count = row.try_get("cnt").unwrap_or(0);
@@ -380,9 +500,66 @@ impl App {
     }
 
     fn push_tool(&mut self, line: String) {
-        self.tool_lines.push(line);
-        if self.tool_auto_scroll {
-            self.tool_scroll = u16::MAX;
+        self.activity.push(line);
+    }
+
+    fn active_pane_mut(&mut self) -> &mut LogPane {
+        if self.active_tab == 0 {
+            &mut self.activity
+        } else {
+            &mut self.specialists[self.active_tab - 1].pane
+        }
+    }
+
+    /// Route a specialist event into its tab pane and update its live status.
+    /// Job outcomes (but not stage chatter) are mirrored into the ALL pane.
+    fn push_specialist(&mut self, kind: SpecialistKind, update: SpecialistUpdate) {
+        let idx = spec_idx(kind);
+        let tag = kind.short_label();
+        match update {
+            SpecialistUpdate::Started { file_id } => {
+                let tab = &mut self.specialists[idx];
+                tab.status = SpecStatus::Running(format!("analyzing file_id={file_id}"));
+                tab.pane.push(format!("▶ analyzing file_id={file_id}"));
+                self.activity
+                    .push(format!("▶ [{tag}] analyzing file_id={file_id}"));
+            }
+            SpecialistUpdate::Stage { message: msg } => {
+                let tab = &mut self.specialists[idx];
+                tab.pane.push(format!("    {msg}"));
+                tab.status = SpecStatus::Running(msg);
+            }
+            SpecialistUpdate::Finished {
+                file_name,
+                score,
+                summary,
+                cached,
+            } => {
+                let cached_tag = if cached { " (cached)" } else { "" };
+                let score_tag = score.map(|s| format!(" — score {s}")).unwrap_or_default();
+                let tab = &mut self.specialists[idx];
+                tab.status = SpecStatus::Idle;
+                tab.done += 1;
+                tab.pane
+                    .push(format!("✓ '{file_name}'{cached_tag}{score_tag}"));
+                if !summary.is_empty() {
+                    tab.pane.push(format!("    ↳ {summary}"));
+                }
+                tab.pane.push(String::new());
+                self.activity
+                    .push(format!("✓ [{tag}] '{file_name}'{cached_tag}{score_tag}"));
+                if !summary.is_empty() {
+                    self.activity.push(format!("  ↳ {summary}"));
+                }
+            }
+            SpecialistUpdate::Failed { error: err } => {
+                let tab = &mut self.specialists[idx];
+                tab.status = SpecStatus::Idle;
+                tab.failed += 1;
+                tab.pane.push(format!("✗ {err}"));
+                tab.pane.push(String::new());
+                self.activity.push(format!("✗ [{tag}] {err}"));
+            }
         }
     }
 
@@ -436,7 +613,7 @@ impl App {
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
-                "  │  Tab: switch focus  │  Alt+←/→: resize panes  │  PgUp/Dn: scroll  │  Ctrl+C: quit",
+                "  │  Tab: switch focus  │  ←/→: activity tabs  │  Alt+←/→: resize  │  Ctrl+C: quit",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -514,40 +691,121 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
         let title = if focused {
-            " TOOL ACTIVITY [↑↓ scroll │ End: jump to bottom] "
+            " ACTIVITY [←/→ or 1-4: tab │ ↑↓: scroll │ End: follow] "
         } else {
-            " TOOL ACTIVITY "
+            " ACTIVITY "
         };
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_style(border_style);
-
         let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        let lines: Vec<Line> = self
-            .tool_lines
-            .iter()
-            .map(|l| {
-                Line::from(Span::styled(
-                    l.clone(),
-                    Style::default().fg(Color::DarkGray),
-                ))
-            })
-            .collect();
-
-        let total = approx_line_count(&lines, inner.width);
-        let max_scroll = total.saturating_sub(inner.height);
-        let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-
-        if self.tool_auto_scroll {
-            self.tool_scroll = max_scroll;
+        // Row 0: tab strip; specialist tabs add a one-line status header.
+        let (tabs_area, status_area, log_area) = if self.active_tab == 0 {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(inner);
+            (rows[0], None, rows[1])
         } else {
-            self.tool_scroll = self.tool_scroll.min(max_scroll);
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                ])
+                .split(inner);
+            (rows[0], Some(rows[1]), rows[2])
+        };
+
+        self.render_tab_strip(frame, tabs_area);
+        if let Some(status_area) = status_area {
+            self.render_specialist_status(frame, status_area, self.active_tab - 1);
         }
 
-        let para = para.block(block).scroll((self.tool_scroll, 0));
-        frame.render_widget(para, area);
+        let pane = self.active_pane_mut();
+        let lines: Vec<Line<'static>> = pane
+            .lines
+            .iter()
+            .map(|l| Line::from(Span::styled(l.clone(), log_line_style(l))))
+            .collect();
+        let total = approx_line_count(&lines, log_area.width);
+        let max_scroll = total.saturating_sub(log_area.height);
+        if pane.auto_scroll {
+            pane.scroll = max_scroll;
+        } else {
+            pane.scroll = pane.scroll.min(max_scroll);
+        }
+        let scroll = pane.scroll;
+
+        let para = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(para, log_area);
+    }
+
+    fn render_tab_strip(&self, frame: &mut Frame, area: Rect) {
+        let mut titles: Vec<Line> = vec![Line::from(" ALL ")];
+        for tab in &self.specialists {
+            let mut spans = vec![Span::raw(" ")];
+            if matches!(tab.status, SpecStatus::Running(_)) {
+                spans.push(Span::styled(
+                    format!("{} ", SPINNER[self.spinner_tick % SPINNER.len()]),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            spans.push(Span::raw(tab.kind.short_label().to_uppercase()));
+            if tab.done > 0 {
+                spans.push(Span::styled(
+                    format!(" ✓{}", tab.done),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            if tab.failed > 0 {
+                spans.push(Span::styled(
+                    format!(" ✗{}", tab.failed),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            spans.push(Span::raw(" "));
+            titles.push(Line::from(spans));
+        }
+
+        let tabs = Tabs::new(titles)
+            .select(self.active_tab)
+            .style(Style::default().fg(Color::Gray))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        frame.render_widget(tabs, area);
+    }
+
+    fn render_specialist_status(&self, frame: &mut Frame, area: Rect, idx: usize) {
+        let tab = &self.specialists[idx];
+        let line = match &tab.status {
+            SpecStatus::Running(stage) => Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Yellow)),
+                Span::styled(stage.clone(), Style::default().fg(Color::Yellow)),
+            ]),
+            SpecStatus::Idle if tab.done + tab.failed == 0 => Line::from(Span::styled(
+                "○ idle — no delegations this session",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            SpecStatus::Idle => Line::from(Span::styled(
+                format!("○ idle — {} completed, {} failed", tab.done, tab.failed),
+                Style::default().fg(Color::DarkGray),
+            )),
+        };
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_input(&self, frame: &mut Frame, area: Rect) {
@@ -624,10 +882,7 @@ impl App {
             )
         } else {
             match self.status {
-                Status::Idle => (
-                    " IDLE ",
-                    Style::default().fg(Color::Black).bg(Color::Green),
-                ),
+                Status::Idle => (" IDLE ", Style::default().fg(Color::Black).bg(Color::Green)),
                 Status::Thinking => (
                     " THINKING ",
                     Style::default().fg(Color::Black).bg(Color::Yellow),
@@ -636,14 +891,14 @@ impl App {
         };
 
         let spinner = if self.anim_full.is_some() {
-            " ▍ ".to_string()  // writing cursor during typewriter animation
+            " ▍ ".to_string() // writing cursor during typewriter animation
         } else if self.status == Status::Thinking && self.pending_approval.is_none() {
             format!(" {} ", SPINNER[self.spinner_tick % SPINNER.len()])
         } else {
             "   ".to_string()
         };
 
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(status_label, status_style),
             Span::raw(spinner),
             Span::styled(
@@ -669,9 +924,21 @@ impl App {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-        ]);
+        ];
 
-        frame.render_widget(Paragraph::new(line), area);
+        let running = self
+            .specialists
+            .iter()
+            .filter(|t| matches!(t.status, SpecStatus::Running(_)))
+            .count();
+        if running > 0 {
+            spans.push(Span::styled(
+                format!("  │  Specialists running: {}", running),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_approval(&self, frame: &mut Frame, area: Rect) {
@@ -680,7 +947,9 @@ impl App {
             None => return,
         };
 
-        let popup_w = (area.width * 2 / 3).max(52).min(area.width.saturating_sub(4));
+        let popup_w = (area.width * 2 / 3)
+            .max(52)
+            .min(area.width.saturating_sub(4));
         let popup_h = 8u16;
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
@@ -692,11 +961,7 @@ impl App {
             .title(" ⚠  APPROVAL REQUIRED ")
             .title_alignment(Alignment::Center)
             .borders(Borders::ALL)
-            .border_style(
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
 
         let max_w = popup_w.saturating_sub(4) as usize;
         let prompt: String = req
@@ -789,15 +1054,15 @@ fn collect_text(value: &serde_json::Value, chunks: &mut Vec<String>) {
 // ── Entry point ────────────────────────────────────────────────────────────
 
 pub async fn run(
-    agent: ExhumeAgent,
+    session: AgentSession,
     pool: Arc<SqlitePool>,
     report_mode: ReportMode,
-    mut ui_rx: mpsc::UnboundedReceiver<UiEvent>,
+    mut ui_rx: mpsc::Receiver<UiEvent>,
     evidence_path: String,
     provider: String,
     model: String,
 ) -> Result<()> {
-    let history = agent.load_history().await.unwrap_or_default();
+    let history = session.history().await;
 
     use sqlx::Row;
     let notes_count = sqlx::query("SELECT COUNT(*) as cnt FROM investigation_notes")
@@ -813,7 +1078,7 @@ pub async fn run(
             .unwrap_or(0);
 
     let mut app = App::new(
-        agent,
+        session,
         pool,
         history,
         format!("Evidence: {}", evidence_path),
@@ -882,29 +1147,26 @@ pub async fn run(
     loop_result
 }
 
-async fn submit(
-    app: &mut App,
-    agent_tx: &mpsc::Sender<Result<String, String>>,
-) -> Result<()> {
+async fn submit(app: &mut App, agent_tx: &mpsc::Sender<Result<String, String>>) -> Result<()> {
     let text = std::mem::take(&mut app.input).trim().to_string();
     app.input_cursor = 0;
 
-    let user_msg = Message::user(text.clone());
-    app.agent.save_message(&user_msg).await?;
-    app.history.push(user_msg);
     app.messages.push(ChatMsg {
         role: Role::User,
-        text,
+        text: text.clone(),
     });
     app.conv_scroll = u16::MAX;
     app.status = Status::Thinking;
-    app.tool_auto_scroll = true;
+    app.activity.auto_scroll = true;
 
     let tx = agent_tx.clone();
-    let ag = app.agent.clone();
-    let hist = app.history.clone();
+    let session = app.session.clone();
     tokio::spawn(async move {
-        let r = ag.chat(&hist).await.map_err(|e| e.to_string());
+        let r = session
+            .submit(text, None)
+            .await
+            .map(|(_, response)| response)
+            .map_err(|e| e.to_string());
         let _ = tx.send(r).await;
     });
 

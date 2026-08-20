@@ -39,6 +39,7 @@ pub async fn ensure_ai_artifact(
 }
 
 /// Stores the specialist's text and JSON interpretation back into `artifact_objects`.
+#[allow(clippy::too_many_arguments)]
 pub async fn store_specialist_result(
     pool: &SqlitePool,
     evidence_id: i64,

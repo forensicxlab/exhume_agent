@@ -84,7 +84,6 @@ impl Tool for SaveInvestigationNoteTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        use colored::Colorize;
         let significance = args.significance.unwrap_or(0).clamp(0, 100);
 
         if let Some(ui) = &self.ui {
@@ -93,12 +92,10 @@ impl Tool for SaveInvestigationNoteTool {
                 &args.note
             ));
         } else {
-            println!(
-                "  {} {} [sig={}]: {}",
-                "🛠️".magenta(),
-                "Saving investigation note".bold(),
+            tracing::info!(
                 significance,
-                args.note.dimmed()
+                note = %args.note,
+                "Saving investigation note"
             );
         }
 

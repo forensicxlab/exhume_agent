@@ -4,6 +4,7 @@ pub mod list_dir;
 pub mod notes;
 pub mod partitions;
 pub mod query_index;
+pub mod query_sqlite;
 pub mod report;
 pub mod shell;
 pub mod specialists;

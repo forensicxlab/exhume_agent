@@ -327,7 +327,13 @@ async fn rebuild_report(pool: &SqlitePool, report_id: i64) -> Result<()> {
     .execute(pool)
     .await?;
 
-    std::fs::write(&export_path, &markdown)?;
+    let export_path = PathBuf::from(export_path);
+    if let Some(parent) = export_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp_path = export_path.with_extension(format!("{}.tmp", crate::ui::unique_id("report")));
+    std::fs::write(&temp_path, &markdown)?;
+    std::fs::rename(&temp_path, &export_path)?;
     Ok(())
 }
 

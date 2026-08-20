@@ -30,6 +30,11 @@ fn spawn_progress_monitor(mut rx: mpsc::Receiver<IndexerEvent>) -> JoinHandle<()
                     pb.set_length(total);
                     pb.set_position(current);
                 }
+                IndexerEventType::ParserProgress { current, total, .. } => {
+                    pb.set_length(total);
+                    pb.set_position(current.min(total));
+                    pb.set_message(event.message);
+                }
                 IndexerEventType::Success => {
                     pb.finish_with_message(format!("{} {}", "[SUCCESS]".green(), event.message));
                 }

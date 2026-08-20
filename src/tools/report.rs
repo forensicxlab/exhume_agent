@@ -20,6 +20,7 @@ pub struct UpdateDigitalReportArgs {
 pub struct UpdateDigitalReportOutput {
     pub success: bool,
     pub export_path: Option<String>,
+    pub supporting_event_ids: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -50,7 +51,7 @@ impl Tool for UpdateDigitalReportTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Append a court-oriented finding to the persisted Digital Forensics Report. Every substantive finding should include reproducible methodology steps and supporting evidence references.".to_string(),
+            description: "Append a court-oriented finding to the persisted Digital Forensics Report. The host automatically attaches successful forensic tool-event IDs from the current turn and rejects ungrounded updates.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -91,9 +92,33 @@ impl Tool for UpdateDigitalReportTool {
             return Ok(UpdateDigitalReportOutput {
                 success: false,
                 export_path: None,
+                supporting_event_ids: Vec::new(),
                 error: Some("Reporting is disabled for this session.".to_string()),
             });
         }
+
+        let supporting_event_ids = self
+            .ui
+            .as_ref()
+            .map(UiHandle::supporting_event_ids)
+            .unwrap_or_default();
+        if supporting_event_ids.is_empty() {
+            return Ok(UpdateDigitalReportOutput {
+                success: false,
+                export_path: None,
+                supporting_event_ids,
+                error: Some(
+                    "Report update rejected: no successful forensic tool event exists in the current turn."
+                        .to_string(),
+                ),
+            });
+        }
+        let mut supporting_evidence = args.supporting_evidence;
+        supporting_evidence.extend(
+            supporting_event_ids
+                .iter()
+                .map(|event_id| format!("Agent tool event: {event_id}")),
+        );
 
         report::append_report_update(
             &self.pool,
@@ -103,7 +128,7 @@ impl Tool for UpdateDigitalReportTool {
                 summary: args.summary,
                 details_markdown: args.details_markdown,
                 methodology_steps: args.methodology_steps,
-                supporting_evidence: args.supporting_evidence,
+                supporting_evidence,
             },
         )
         .await
@@ -123,12 +148,13 @@ impl Tool for UpdateDigitalReportTool {
 
         if let Some(ui) = &self.ui {
             ui.log(format!("Digital report updated: {}", export_path));
-            ui.report_updated();
+            ui.report_updated_at(Some(export_path.clone()));
         }
 
         Ok(UpdateDigitalReportOutput {
             success: true,
             export_path: Some(export_path),
+            supporting_event_ids,
             error: None,
         })
     }

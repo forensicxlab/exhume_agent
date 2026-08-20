@@ -1,6 +1,5 @@
 use crate::evidence_io;
 use crate::ui::UiHandle;
-use colored::Colorize;
 use exhume_filesystem::Filesystem;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -78,16 +77,11 @@ impl Tool for DetectFilesystemTool {
         if let Some(ui) = &self.ui {
             ui.log(format!("Detecting filesystem at offset {}...", args.offset));
         } else {
-            println!(
-                "  {} {} (offset: {})...",
-                "🛠️".magenta(),
-                "Detecting filesystem".bold(),
-                args.offset
-            );
+            tracing::info!(offset = args.offset, "Detecting filesystem");
         }
 
         let fs_res = if let Some(pid) = args.partition_id {
-            evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)
+            evidence_io::open_filesystem(&self.image_path, pid, &self.pool)
                 .await
                 .map_err(|e| DetectFilesystemError(e.to_string()))
         } else {

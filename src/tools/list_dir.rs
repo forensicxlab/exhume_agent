@@ -1,6 +1,5 @@
 use crate::evidence_io;
 use crate::ui::UiHandle;
-use colored::Colorize;
 use exhume_filesystem::filesystem::{DirectoryCommon, FileCommon};
 use exhume_filesystem::Filesystem;
 use rig::completion::ToolDefinition;
@@ -96,16 +95,11 @@ impl Tool for ListDirTool {
                 args.file_id.unwrap_or(0)
             ));
         } else {
-            println!(
-                "  {} {} (id: {})...",
-                "🛠️".magenta(),
-                "Listing directory".bold(),
-                args.file_id.unwrap_or(0)
-            );
+            tracing::info!(file_id = args.file_id.unwrap_or(0), "Listing directory");
         }
 
         let mut fs = if let Some(pid) = args.partition_id {
-            evidence_io::open_filesystem(&self.image_path, pid, &*self.pool)
+            evidence_io::open_filesystem(&self.image_path, pid, &self.pool)
                 .await
                 .map_err(|e| ListDirError(e.to_string()))?
         } else {

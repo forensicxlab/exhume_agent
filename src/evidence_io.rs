@@ -5,6 +5,7 @@ use exhume_filesystem::detected_fs::{
 use exhume_filesystem::Filesystem;
 use exhume_indexer::get_partition;
 use log::error;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,18 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 #[error("EvidenceIOError: {0}")]
 pub struct EvidenceIOError(pub String);
+
+#[derive(Debug)]
+pub struct ExtractedFile {
+    pub content: Vec<u8>,
+    pub file_name: String,
+    pub absolute_path: String,
+    pub dump_path: PathBuf,
+    pub sha256: String,
+    pub evidence_id: i64,
+    pub partition_id: i64,
+    pub database_file_id: i64,
+}
 
 /// Resolve a partition's byte offset and size from the index database.
 ///
@@ -70,16 +83,15 @@ pub async fn open_filesystem(
 
 /// Extract file bytes from evidence via the index database.
 ///
-/// Returns `(content, file_name, absolute_path, dump_path)`.
 pub async fn extract_file_bytes(
     pool: &SqlitePool,
     image_path: &str,
     file_id: u64,
     partition_id: i64,
     extraction_dir: &Path,
-) -> Result<(Vec<u8>, String, String, PathBuf), EvidenceIOError> {
+) -> Result<ExtractedFile, EvidenceIOError> {
     let file_row = sqlx::query(
-        "SELECT name, absolute_path FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1",
+        "SELECT id, evidence_id, name, absolute_path FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1",
     )
     .bind(file_id as i64)
     .bind(partition_id)
@@ -89,6 +101,8 @@ pub async fn extract_file_bytes(
 
     let file_name: String = file_row.try_get("name").unwrap_or_default();
     let absolute_path: String = file_row.try_get("absolute_path").unwrap_or_default();
+    let evidence_id: i64 = file_row.try_get("evidence_id").unwrap_or(0);
+    let database_file_id: i64 = file_row.try_get("id").unwrap_or(0);
 
     let content = if image_path.is_empty() {
         return Err(EvidenceIOError("Empty image path provided".to_string()));
@@ -108,16 +122,47 @@ pub async fn extract_file_bytes(
             .map_err(|e| EvidenceIOError(format!("Failed to read file bytes: {}", e)))?
     };
 
-    // Persistent dump to host
+    let sha256 = hex::encode(Sha256::digest(&content));
     let safe_name = file_name.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
-    let dump_filename = format!("{}_{}", file_id, safe_name);
-    let dump_path = extraction_dir.join(dump_filename);
+    let scoped_dir = extraction_dir
+        .join(format!("evidence_{evidence_id}"))
+        .join(format!("partition_{partition_id}"));
+    std::fs::create_dir_all(&scoped_dir).map_err(|error| {
+        EvidenceIOError(format!(
+            "Failed to create extraction directory {}: {error}",
+            scoped_dir.display()
+        ))
+    })?;
+    let dump_filename = format!(
+        "{}_{}_{}_{}",
+        database_file_id,
+        file_id,
+        &sha256[..12],
+        safe_name
+    );
+    let dump_path = scoped_dir.join(dump_filename);
 
     if !dump_path.exists() {
-        if let Err(e) = std::fs::write(&dump_path, &content) {
-            error!("Failed to dump file to host: {}", e);
+        let temp_path = scoped_dir.join(format!(".{}.tmp", crate::ui::unique_id("extract")));
+        if let Err(error) = std::fs::write(&temp_path, &content)
+            .and_then(|_| std::fs::rename(&temp_path, &dump_path))
+        {
+            let _ = std::fs::remove_file(&temp_path);
+            error!("Failed to persist extracted file: {}", error);
+            return Err(EvidenceIOError(format!(
+                "Failed to persist extracted file: {error}"
+            )));
         }
     }
 
-    Ok((content, file_name, absolute_path, dump_path))
+    Ok(ExtractedFile {
+        content,
+        file_name,
+        absolute_path,
+        dump_path,
+        sha256,
+        evidence_id,
+        partition_id,
+        database_file_id,
+    })
 }

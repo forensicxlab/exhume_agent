@@ -4,7 +4,9 @@ use dotenvy::dotenv;
 use exhume_agent::agent::ExhumeAgent;
 use exhume_agent::config::AgentConfig;
 use exhume_agent::paths;
+use exhume_agent::policy::{AgentOptions, AgentPolicy};
 use exhume_agent::report::{self, ReportMode};
+use exhume_agent::session::AgentSession;
 use exhume_agent::tui;
 use exhume_agent::ui::UiHandle;
 use exhume_body::Body;
@@ -24,7 +26,7 @@ struct Args {
     #[arg(short, long, conflicts_with = "image")]
     folder: Option<String>,
 
-    /// LLM Provider (openai, ollama, anthropic, etc.)
+    /// LLM Provider (openai, ollama, or copilot)
     #[arg(short, long, env = "AGENT_PROVIDER")]
     provider: Option<String>,
 
@@ -47,6 +49,10 @@ struct Args {
     /// Start a fresh conversation (clears chat history from the database)
     #[arg(short = 'n', long)]
     new_session: bool,
+
+    /// Allow the agent to request approved host shell commands
+    #[arg(long, default_value_t = false)]
+    allow_shell: bool,
 }
 
 use tracing_subscriber::EnvFilter;
@@ -156,8 +162,21 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     let pool = std::sync::Arc::new(pool);
+    let evidence_id = report::current_evidence_id(pool.as_ref())
+        .await
+        .unwrap_or(1);
+    let policy = AgentPolicy {
+        allow_shell: args.allow_shell,
+        shell_working_dir: Some(paths::extraction_dir_for_db(&db_path)),
+        ..AgentPolicy::default()
+    };
+    let options = AgentOptions {
+        session_id: "default".to_string(),
+        evidence_id,
+        policy: policy.clone(),
+    };
 
-    let agent_probe = ExhumeAgent::new(
+    let agent_probe = ExhumeAgent::new_with_options(
         config.clone(),
         target_path.clone(),
         db_path.clone(),
@@ -165,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         args.logical,
         false,
         None,
+        options.clone(),
     );
     let mut existing_messages = agent_probe.load_history().await.unwrap_or_default();
 
@@ -193,8 +213,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let (ui, ui_rx) = UiHandle::channel();
-    let agent = ExhumeAgent::new(
+    let (ui, ui_rx) = UiHandle::channel_with_context("default", evidence_id, 512);
+    let agent = ExhumeAgent::new_with_options(
         config,
         target_path.clone(),
         db_path,
@@ -202,7 +222,9 @@ async fn main() -> anyhow::Result<()> {
         args.logical,
         report_mode.enabled,
         Some(ui),
+        options,
     );
+    let session = AgentSession::open(agent).await?;
 
     println!(
         "{}",
@@ -213,7 +235,16 @@ async fn main() -> anyhow::Result<()> {
         "===============================================\n".blue()
     );
 
-    tui::run(agent, pool, report_mode, ui_rx, target_path, provider, model).await?;
+    tui::run(
+        session,
+        pool,
+        report_mode,
+        ui_rx,
+        target_path,
+        provider,
+        model,
+    )
+    .await?;
 
     Ok(())
 }
