@@ -105,7 +105,12 @@ impl Tool for ListDirTool {
         } else {
             use exhume_body::Body;
             use exhume_filesystem::detected_fs::detect_filesystem;
-            let body = Body::new(self.image_path.clone(), "auto");
+            let body = Body::try_new(self.image_path.clone(), "auto").map_err(|error| {
+                ListDirError(format!(
+                    "Unable to open evidence source '{}': {error}",
+                    self.image_path
+                ))
+            })?;
             detect_filesystem(&body, args.offset, args.partition_size, None)
                 .map_err(|e| ListDirError(format!("Could not mount partition: {}", e)))?
         };

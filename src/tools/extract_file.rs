@@ -127,7 +127,12 @@ impl Tool for ExtractFileTool {
 
         use exhume_body::Body;
         use exhume_filesystem::detected_fs::detect_filesystem;
-        let body = Body::new(self.image_path.clone(), "auto");
+        let body = Body::try_new(self.image_path.clone(), "auto").map_err(|error| {
+            ExtractFileError(format!(
+                "Unable to open evidence source '{}': {error}",
+                self.image_path
+            ))
+        })?;
         let mut fs = detect_filesystem(&body, args.offset, args.partition_size, None)
             .map_err(|e| ExtractFileError(format!("Could not mount partition: {}", e)))?;
 

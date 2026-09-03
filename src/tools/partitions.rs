@@ -64,7 +64,12 @@ impl Tool for ListPartitionsTool {
         } else {
             tracing::info!("Listing partitions");
         }
-        let mut body = Body::new(self.image_path.clone(), "auto");
+        let mut body = Body::try_new(self.image_path.clone(), "auto").map_err(|error| {
+            PartitionError(format!(
+                "Unable to open evidence source '{}': {error}",
+                self.image_path
+            ))
+        })?;
 
         let sector_size = body.get_sector_size();
         let mut results = Vec::new();

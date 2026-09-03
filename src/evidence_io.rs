@@ -76,7 +76,12 @@ pub async fn open_filesystem(
             bitlocker_fvek: Some(fvek),
         });
 
-    let body = Body::new(image_path.to_string(), "auto");
+    let body = Body::try_new(image_path.to_string(), "auto").map_err(|error| {
+        EvidenceIOError(format!(
+            "Unable to open evidence source '{}': {error}",
+            image_path
+        ))
+    })?;
     detect_filesystem(&body, offset, size, key_material)
         .map_err(|e| EvidenceIOError(format!("Filesystem detection failed: {}", e)))
 }

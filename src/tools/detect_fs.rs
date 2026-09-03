@@ -87,9 +87,16 @@ impl Tool for DetectFilesystemTool {
         } else {
             use exhume_body::Body;
             use exhume_filesystem::detected_fs::detect_filesystem;
-            let body = Body::new(self.image_path.clone(), "auto");
-            detect_filesystem(&body, args.offset, args.partition_size, None)
-                .map_err(|e| DetectFilesystemError(format!("Could not mount partition: {}", e)))
+            match Body::try_new(self.image_path.clone(), "auto") {
+                Ok(body) => detect_filesystem(&body, args.offset, args.partition_size, None)
+                    .map_err(|e| {
+                        DetectFilesystemError(format!("Could not mount partition: {}", e))
+                    }),
+                Err(error) => Err(DetectFilesystemError(format!(
+                    "Unable to open evidence source '{}': {error}",
+                    self.image_path
+                ))),
+            }
         };
 
         match fs_res {
