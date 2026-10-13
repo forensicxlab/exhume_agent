@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_agent"
-version = "0.1.3"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -1117,9 +1117,9 @@ dependencies = [
 
 [[package]]
 name = "exhume_artefacts"
-version = "0.3.2"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee93d0283f87e8ecb00f7659d30bf16afa4726d8f5df3eeef3a8c8890945432b"
+checksum = "83bc79b6a055c9c176c53b105443d8ee8b27c74ec68189208a4c41f5cab03b5b"
 dependencies = [
  "anyhow",
  "base64",
@@ -1169,9 +1169,9 @@ dependencies = [
 
 [[package]]
 name = "exhume_exfat"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ea25a16489ed356a0bd3c57754ba4a709c3ba3b3b2ef8739819da660356de0d"
+checksum = "e04751f8ac77208114b3254c55754df0841d4c7aa3f97b55a8b554c6dc07116f"
 dependencies = [
  "chrono",
  "clap",
@@ -1205,9 +1205,9 @@ dependencies = [
 
 [[package]]
 name = "exhume_filesystem"
-version = "0.5.4"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1ef09abe3c6a74c6c0779f682194dfd6b25f2aa706ec90e05bc2bb2755d64eb"
+checksum = "1ba3ae1071969301dd0df22e689e5cf5edc8b250d4c076f79fa75ab49fa44294"
 dependencies = [
  "clap",
  "clap-num",
@@ -1233,14 +1233,16 @@ dependencies = [
  "sqlx",
  "unicode-casefold",
  "unicode-normalization",
+ "winapi-util",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "exhume_indexer"
-version = "0.2.2"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd052ae523446e596695a4fdca0ac73e0fbd8efe49262b9e72713c15a39a95d"
+checksum = "4204bbc080cbd69e4a45de6e26c84b4a04bc066923922e8a534179ed1c515181"
 dependencies = [
  "anyhow",
  "clap",
