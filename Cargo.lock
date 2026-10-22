@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_agent"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1099,9 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_apfs"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "111273ff1a7b078217d88762f2afb442bf14ec4946184d17db9e5dbd53bb0a40"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "chrono",
@@ -1117,9 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_artefacts"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83bc79b6a055c9c176c53b105443d8ee8b27c74ec68189208a4c41f5cab03b5b"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1145,9 +1141,9 @@ dependencies = [
 
 [[package]]
 name = "exhume_body"
-version = "0.5.7"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f02bbbe55d097b7a0f6429192ee5b0d2d0ec14deeb3d34253ca95e1b6483bc2"
+checksum = "de941487eff4f17b17341c201de6a9233c618ab2585fb03c09ab0dd155e2a293"
 dependencies = [
  "clap",
  "clap-num",
@@ -1169,9 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_exfat"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e04751f8ac77208114b3254c55754df0841d4c7aa3f97b55a8b554c6dc07116f"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1187,9 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_extfs"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b92ba1bc0d993387ea00d32c674fb1a269ef3c3477e1318826c4c715dc943567"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "chrono",
@@ -1205,9 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_filesystem"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ba3ae1071969301dd0df22e689e5cf5edc8b250d4c076f79fa75ab49fa44294"
+version = "0.6.0"
 dependencies = [
  "clap",
  "clap-num",
@@ -1240,9 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_indexer"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4204bbc080cbd69e4a45de6e26c84b4a04bc066923922e8a534179ed1c515181"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1265,9 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_lvm"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0593a3f316139bd710d0d4c51084f4c15ea135c0e60dffd367191f9f7d66f30b"
+version = "0.2.0"
 dependencies = [
  "acid_io",
  "byteorder",
@@ -1285,9 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_ntfs"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b6f5dacea536b9e5a4922b1109bc1b0da56654cc5621fe874aa53fc7e85bc35"
+version = "0.2.0"
 dependencies = [
  "aes",
  "byteorder",
@@ -1309,9 +1293,7 @@ dependencies = [
 
 [[package]]
 name = "exhume_partitions"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66a2916875d824cc2f44e1d7ab19b39bbe046e82bf193a5454702801172dccb5"
+version = "0.4.0"
 dependencies = [
  "byteorder",
  "capstone",
