@@ -1,5 +1,6 @@
 use crate::evidence_io;
 use crate::ui::UiHandle;
+use exhume_filesystem::filesystem::FileCommon;
 use exhume_filesystem::Filesystem;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -150,6 +151,11 @@ impl Tool for ExtractFileTool {
             }
         };
 
+        if file.size() > evidence_io::MAX_EXTRACTION_BYTES {
+            return Err(ExtractFileError(
+                "File exceeds the 512 MiB interactive extraction limit".into(),
+            ));
+        }
         match fs.read_file_content(&file) {
             Ok(data) => {
                 let sha256 = hex::encode(Sha256::digest(&data));

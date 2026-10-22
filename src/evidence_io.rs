@@ -2,12 +2,39 @@ use exhume_body::Body;
 use exhume_filesystem::detected_fs::{
     detect_filesystem, detect_filesystem_from_path, DetectedFs, ImageStream, KeyMaterial,
 };
+use exhume_filesystem::filesystem::FileCommon;
 use exhume_filesystem::Filesystem;
 use exhume_indexer::get_partition;
 use log::error;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
+
+/// Interactive extraction is deliberately bounded; larger acquisitions need a separate step.
+pub const MAX_EXTRACTION_BYTES: u64 = 512 * 1024 * 1024;
+
+pub fn confined_source_path(root: &Path, relative: &str) -> Result<PathBuf, EvidenceIOError> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| EvidenceIOError(e.to_string()))?;
+    let candidate = root
+        .join(relative.trim_start_matches('/'))
+        .canonicalize()
+        .map_err(|e| EvidenceIOError(e.to_string()))?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        return Err(EvidenceIOError(
+            "Evidence path escapes the selected folder or is not a file".into(),
+        ));
+    }
+    Ok(candidate)
+}
+
+fn check_extraction_size(size: u64) -> Result<(), EvidenceIOError> {
+    if size > MAX_EXTRACTION_BYTES {
+        return Err(EvidenceIOError("File exceeds the 512 MiB interactive extraction limit; propose a bounded external-tool step".into()));
+    }
+    Ok(())
+}
 
 /// Errors originating from the evidence IO layer.
 #[derive(Debug, thiserror::Error)]
@@ -112,7 +139,12 @@ pub async fn extract_file_bytes(
     let content = if image_path.is_empty() {
         return Err(EvidenceIOError("Empty image path provided".to_string()));
     } else if Path::new(image_path).is_dir() {
-        let full_path = Path::new(image_path).join(absolute_path.trim_start_matches('/'));
+        let full_path = confined_source_path(Path::new(image_path), &absolute_path)?;
+        check_extraction_size(
+            std::fs::metadata(&full_path)
+                .map_err(|e| EvidenceIOError(e.to_string()))?
+                .len(),
+        )?;
         std::fs::read(&full_path).map_err(|e| {
             EvidenceIOError(format!("Local FS Error reading {:?}: {}", full_path, e))
         })?
@@ -122,6 +154,8 @@ pub async fn extract_file_bytes(
         let file = fs.get_file(file_id).map_err(|e| {
             EvidenceIOError(format!("File lookup failed for id {}: {}", file_id, e))
         })?;
+
+        check_extraction_size(file.size())?;
 
         fs.read_file_content(&file)
             .map_err(|e| EvidenceIOError(format!("Failed to read file bytes: {}", e)))?
@@ -147,7 +181,14 @@ pub async fn extract_file_bytes(
     );
     let dump_path = scoped_dir.join(dump_filename);
 
-    if !dump_path.exists() {
+    if dump_path.exists() {
+        let persisted = std::fs::read(&dump_path).map_err(|e| EvidenceIOError(e.to_string()))?;
+        if hex::encode(Sha256::digest(&persisted)) != sha256 {
+            return Err(EvidenceIOError(
+                "Existing extracted file failed SHA-256 verification".into(),
+            ));
+        }
+    } else {
         let temp_path = scoped_dir.join(format!(".{}.tmp", crate::ui::unique_id("extract")));
         if let Err(error) = std::fs::write(&temp_path, &content)
             .and_then(|_| std::fs::rename(&temp_path, &dump_path))
@@ -170,4 +211,29 @@ pub async fn extract_file_bytes(
         partition_id,
         database_file_id,
     })
+}
+
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
+    #[test]
+    fn rejects_parent_escape_and_allows_selected_file() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("evidence");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(root.path().join("outside"), b"private").unwrap();
+        std::fs::write(folder.join("inside"), b"evidence").unwrap();
+        assert!(confined_source_path(&folder, "../outside").is_err());
+        assert!(confined_source_path(&folder, "/inside").is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("evidence");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(root.path().join("outside"), b"private").unwrap();
+        std::os::unix::fs::symlink(root.path().join("outside"), folder.join("link")).unwrap();
+        assert!(confined_source_path(&folder, "link").is_err());
+    }
 }

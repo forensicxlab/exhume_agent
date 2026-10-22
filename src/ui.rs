@@ -308,6 +308,11 @@ impl UiHandle {
         }
     }
 
+    /// Publish an envelope that the caller has already persisted durably.
+    pub(crate) fn emit_persisted(&self, event: AgentEvent) -> bool {
+        self.sink.emit(event)
+    }
+
     pub fn log<S: Into<String>>(&self, message: S) {
         self.log_with_level(AgentLogLevel::Info, message);
     }

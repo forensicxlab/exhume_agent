@@ -199,8 +199,17 @@ impl Tool for QuerySqliteFileTool {
         };
         pool.close().await;
 
-        let truncated = rows.len() > max_rows;
+        let mut truncated = rows.len() > max_rows;
         rows.truncate(max_rows);
+        truncated |= rows.iter().any(|row| {
+            row.columns().iter().any(|column| {
+                row.try_get::<String, _>(column.name()).is_ok_and(|value| {
+                    value.chars().count() > MAX_CELL_CHARS || value.contains(['\n', '\r'])
+                }) || row.try_get::<Vec<u8>, _>(column.name()).is_ok_and(|value| {
+                    !value.is_empty() && row.try_get::<String, _>(column.name()).is_err()
+                })
+            })
+        });
         let result = if rows.is_empty() {
             "Query returned 0 rows.".to_string()
         } else {

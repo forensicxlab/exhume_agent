@@ -14,19 +14,22 @@ pub struct ListDirArgs {
     pub partition_size: u64,
     pub partition_id: Option<i64>,
     pub file_id: Option<u64>,
+    pub max_entries: Option<usize>,
 }
 
 #[derive(Serialize)]
 pub struct DirEntryInfo {
     pub file_id: u64,
     pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
+    pub is_dir: Option<bool>,
+    pub size: Option<u64>,
+    pub metadata_error: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct ListDirOutput {
     pub entries: Vec<DirEntryInfo>,
+    pub truncated: bool,
     pub error: Option<String>,
 }
 
@@ -81,7 +84,8 @@ impl Tool for ListDirTool {
                     "file_id": {
                         "type": "integer",
                         "description": "The file ID of the directory to list. Leave this empty/omitted to list the root directory."
-                    }
+                    },
+                    "max_entries": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Bounded directory sample; default 200." }
                 },
                 "required": ["offset", "partition_size"]
             }),
@@ -122,6 +126,7 @@ impl Tool for ListDirTool {
             Err(e) => {
                 return Ok(ListDirOutput {
                     entries: vec![],
+                    truncated: false,
                     error: Some(format!(
                         "Failed to read directory with id {}: {}",
                         target_id, e
@@ -133,31 +138,44 @@ impl Tool for ListDirTool {
         match fs.list_dir(&dir_file) {
             Ok(entries) => {
                 let mut results = Vec::new();
+                let limit = args.max_entries.unwrap_or(200).clamp(1, 1000);
+                let mut truncated = false;
                 for entry in entries {
+                    if results.len() >= limit {
+                        truncated = true;
+                        break;
+                    }
                     if let Ok(file) = fs.get_file(entry.file_id()) {
                         results.push(DirEntryInfo {
                             file_id: entry.file_id(),
                             name: entry.name().to_string(),
-                            is_dir: file.is_dir(),
-                            size: file.size(),
+                            is_dir: Some(file.is_dir()),
+                            size: Some(file.size()),
+                            metadata_error: None,
                         });
                     } else {
                         results.push(DirEntryInfo {
                             file_id: entry.file_id(),
                             name: entry.name().to_string(),
-                            is_dir: false,
-                            size: 0,
+                            is_dir: None,
+                            size: None,
+                            metadata_error: Some(
+                                "Metadata unavailable; type and size are unknown".into(),
+                            ),
                         });
+                        truncated = true;
                     }
                 }
 
                 Ok(ListDirOutput {
                     entries: results,
+                    truncated,
                     error: None,
                 })
             }
             Err(e) => Ok(ListDirOutput {
                 entries: vec![],
+                truncated: false,
                 error: Some(format!("Failed to list directory: {}", e)),
             }),
         }

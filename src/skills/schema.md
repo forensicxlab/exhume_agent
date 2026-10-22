@@ -4,12 +4,12 @@
 Columns: `id`, `evidence_id`, `partition_id`, `identifier`, `absolute_path`, `name`, `ftype`, `size`, `created`, `modified`, `accessed`, `permissions`, `owner`, `group`, `display`, `path_key`, `parent_path_key`, `depth`, `is_dir`, `sig_name`, `sig_mime`, `sig_exts`, `anomaly_flag`, `host_path`, `metadata`
 
 Key semantics:
-- `identifier` — the `file_id` consumed by every tool (`extract_file`, `delegate_*`). Always use this, not `id`.
+- `identifier` — the `file_id` consumed by `extract_file`, `query_sqlite_file`, `describe_image`, and `transcribe_audio`. Use this, not the index row `id`.
 - `ftype` — `'File'` or `'Directory'`; `is_dir` is 1/0 equivalent.
 - `absolute_path` — logical forensic path inside the evidence (e.g. `/Windows/System32/cmd.exe`). Use for pattern matching and artifact path lookups. **Not** a valid host path.
-- `host_path` — real path on the host filesystem (e.g. `/cases/EVIDENCE/Windows/System32/cmd.exe`). **Always** use this for `shell` commands. `NULL` for disk image partitions.
+- `host_path` — a host filesystem path, which may refer to original evidence. It does not grant shell access. Approved external-tool commands must operate on verified extracted copies, using the returned `dump_path`.
 - `sig_name` / `sig_mime` / `sig_exts` — magic-byte file type, populated after identification runs. May be NULL — fall back to filename heuristics (`LOWER(name) LIKE '%.exe'`).
-- `anomaly_flag = 1` — extension does not match magic-byte signature. **High-priority forensic indicator — check this first.**
+- `anomaly_flag = 1` — an indexed extension/signature mismatch. Treat it as an observation to assess against the objective, not proof of malicious activity.
 - `created` / `modified` / `accessed` — Unix epoch seconds. Use the `timeline` view for cross-event temporal queries.
 - `metadata` — JSON blob with filesystem-specific extended attributes (MFT attributes, APFS xattrs, Linux xattrs, etc.).
 
@@ -26,23 +26,24 @@ Columns: `id`, `evidence_id`, `partition_id`, `artifact_id`, `file_id`, `parser`
 - `parser` — producer of the record (e.g. `windows_evtx`, `windows_pe`, `mobile_ios_imessage`, `mobile_ios_whatsapp`, `ai_specialist`)
 - `kind` — record type within parser output (e.g. `event`, `module`, `message`, `record`, `entry`)
 - `text` — human-readable summary; `json` — full structured data
-- **Always query here before delegating** — cached under `parser = 'ai_specialist'`:
+- Historical model analyses may be cached under `parser = 'ai_specialist'`:
   `SELECT file_id, kind, text FROM artifact_objects WHERE parser = 'ai_specialist' AND file_id = ?`
+- Such records are prior interpretations, not newly verified source observations. Check their provenance and corroborate when relevant. The current runtime uses bounded media tools without autonomous specialist loops.
 - Inventory parsed data: `SELECT parser, kind, COUNT(*) FROM artifact_objects GROUP BY parser, kind`
 
 ### partitions
 Columns: `id`, `evidence_id`, `kind`, `first_byte_addr`, `size_sectors`, `sector_size`, `size_bytes`, `fvek`, `description`
 - `kind`: `mbr`, `gpt`, `logical`, `folder`
-- `fvek` — BitLocker Full Volume Encryption Key (hex) if unlocked
+- `fvek` — BitLocker Full Volume Encryption Key (hex) if unlocked. Omit this credential column from inventory queries and model inputs.
 
-### investigation_notes — persistent notepad
+### investigation_notes — legacy notepad
 Columns: `id`, `file_id`, `path`, `note`, `significance`, `created_at`
-- Save with `save_investigation_note`. Retrieve: `SELECT * FROM investigation_notes ORDER BY significance DESC`
+- Historical notes can be queried within approved scope. New findings are saved by `finish_investigation_step` with execution references, exact excerpts and automatically generated reproduction instructions. Legacy significance values are not path-confidence scores.
 
 ### artifact_attachment_refs — messaging app media cross-references
 Key columns: `parser`, `app`, `local_path`, `remote_url`, `kind`, `mime`, `file_name`, `file_size`, `resolved_file_id`, `resolved_host_path`, `preview_base64`
 - Populated by messaging parsers (iMessage, WhatsApp, Signal, Telegram, Messenger).
-- `resolved_host_path` — direct host path to the attachment when resolved; use for `shell` or `extract_file`.
+- `resolved_host_path` — prior host path resolution; verify it against the selected source. Use `resolved_file_id` with the correct partition for supported file tools; external tools require a separately approved extracted copy.
 
 ### Views
 

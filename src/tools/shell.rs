@@ -127,6 +127,8 @@ impl Tool for ShellTool {
             }
         }
         command.env("NO_COLOR", "1");
+        #[cfg(unix)]
+        command.process_group(0);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -136,6 +138,9 @@ impl Tool for ShellTool {
         let mut child = command
             .spawn()
             .map_err(|error| ShellError(format!("Failed to start shell command: {error}")))?;
+        // Dropping a cancelled tool must also stop ordinary descendants of the shell.
+        #[cfg(unix)]
+        let _process_group = ProcessGroup(child.id().map(|id| id as i32));
         let mut stdout = child
             .stdout
             .take()
@@ -185,15 +190,37 @@ impl Tool for ShellTool {
     }
 }
 
+#[cfg(unix)]
+struct ProcessGroup(Option<i32>);
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.filter(|id| *id > 0) {
+            // This group was created for our owned child, never the application's group.
+            unsafe {
+                libc::kill(-id, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 async fn read_bounded(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
     max_bytes: usize,
 ) -> std::io::Result<(Vec<u8>, bool)> {
     let mut output = Vec::with_capacity(max_bytes.min(8192));
-    let mut limited = reader.take(max_bytes as u64 + 1);
-    limited.read_to_end(&mut output).await?;
-    let truncated = output.len() > max_bytes;
-    output.truncate(max_bytes);
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let keep = read.min(max_bytes.saturating_sub(output.len()));
+        output.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
     Ok((output, truncated))
 }
 
@@ -213,6 +240,46 @@ mod tests {
     use crate::policy::AgentPolicy;
     use crate::ui::{UiEvent, UiHandle};
     use rig::tool::Tool;
+
+    #[tokio::test]
+    async fn bounded_capture_drains_large_output() {
+        let bytes = vec![b'x'; 100_000];
+        let mut reader = bytes.as_slice();
+        let (captured, truncated) = super::read_bounded(&mut reader, 16).await.unwrap();
+        assert_eq!(captured.len(), 16);
+        assert!(truncated);
+        assert!(reader.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_shell_stops_descendant_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = AgentPolicy {
+            allow_shell: true,
+            shell_working_dir: Some(directory.path().to_path_buf()),
+            ..Default::default()
+        };
+        let (ui, mut receiver) = UiHandle::channel_with_context("cancel-shell", 1, 16);
+        let tool = ShellTool::new(policy, Some(ui));
+        let execution = tokio::spawn(async move {
+            tool.call(ShellArgs {
+                command: "(sleep 1; printf leaked > late-result) & wait".into(),
+            })
+            .await
+        });
+        while let Some(event) = receiver.recv().await {
+            if let UiEvent::ApprovalRequest { request, .. } = event {
+                request.responder.send(true).unwrap();
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        execution.abort();
+        let _ = execution.await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(!directory.path().join("late-result").exists());
+    }
 
     #[tokio::test]
     async fn shell_is_disabled_by_default() {

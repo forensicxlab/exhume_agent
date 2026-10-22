@@ -82,7 +82,10 @@ impl Tool for ListPartitionsTool {
                     partition_type: "GPT".to_string(),
                     index: i + 1,
                     first_sector: entry.starting_lba,
-                    size_sectors: entry.size_sectors / sector_size as u64,
+                    size_sectors: entry
+                        .ending_lba
+                        .saturating_sub(entry.starting_lba)
+                        .saturating_add(1),
                     bootable: false,
                     type_name: entry.description.clone(),
                 });

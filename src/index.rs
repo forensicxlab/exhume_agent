@@ -49,6 +49,68 @@ fn spawn_progress_monitor(mut rx: mpsc::Receiver<IndexerEvent>) -> JoinHandle<()
     })
 }
 
+/// Prepare local storage only. Discovery belongs to an explicitly approved investigation step.
+pub async fn open_investigation_index(
+    target_path: &str,
+    db_path: &Path,
+    is_folder: bool,
+    is_logical: bool,
+) -> anyhow::Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    ensure_tables(&pool).await?;
+    exhume_agent::ensure_agent_tables(&pool).await?;
+    let existing = sqlx::query_scalar::<_, String>("SELECT path FROM evidence ORDER BY id LIMIT 1")
+        .fetch_optional(&pool)
+        .await?;
+    if let Some(existing) = existing {
+        if std::fs::canonicalize(existing)? != std::fs::canonicalize(target_path)? {
+            anyhow::bail!("Index belongs to a different evidence source");
+        }
+    }
+    let evidence_id = sqlx::query_scalar::<_, i64>("SELECT id FROM evidence ORDER BY id LIMIT 1")
+        .fetch_optional(&pool)
+        .await?
+        .unwrap_or(1);
+    ensure_evidence_row(&pool, evidence_id, target_path, is_folder).await?;
+    if is_folder || is_logical {
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM partitions WHERE evidence_id = ?")
+                .bind(evidence_id)
+                .fetch_one(&pool)
+                .await?;
+        if count == 0 {
+            let size = if is_folder {
+                0
+            } else {
+                std::fs::metadata(target_path)?.len()
+            };
+            insert_partition(
+                &pool,
+                evidence_id,
+                if is_folder {
+                    PartitionKind::Folder
+                } else {
+                    PartitionKind::Logical
+                },
+                0,
+                size / 512,
+                512,
+                size,
+                None,
+            )
+            .await?;
+        }
+    }
+    Ok(pool)
+}
+
 pub async fn init_index(
     target_path: &str,
     db_path: &Path,

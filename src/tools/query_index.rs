@@ -150,7 +150,7 @@ impl Tool for QueryIndexTool {
             }
         };
 
-        let truncated = rows.len() > limit;
+        let mut truncated = rows.len() > limit;
         rows.truncate(limit);
         if rows.is_empty() {
             return Ok(QueryIndexOutput {
@@ -167,10 +167,23 @@ impl Tool for QueryIndexTool {
             .map(|column| column.name().to_string())
             .filter(|name| !LLM_EXCLUDED_COLS.contains(&name.as_str()))
             .collect();
+        // Coverage includes omitted columns and shortened/binary cells, not only the row cap.
+        truncated |= rows[0].columns().len() != columns.len();
+        truncated |= rows.iter().any(|row| {
+            columns.iter().any(|column| {
+                row.try_get::<String, _>(column.as_str())
+                    .is_ok_and(|value| value.chars().count() > LLM_MAX_CELL_CHARS)
+                    || row
+                        .try_get::<Vec<u8>, _>(column.as_str())
+                        .is_ok_and(|value| {
+                            !value.is_empty() && row.try_get::<String, _>(column.as_str()).is_err()
+                        })
+            })
+        });
         let table = render_markdown_table(&rows, &columns);
         let truncation_note = truncated.then(|| {
             format!(
-                "\n[RESULT CAPPED: showing the first {limit} rows. Refine the query to inspect more.]"
+                "\n[PARTIAL DISPLAY: row cap {limit}; long cells, binary values, or metadata/display columns may be omitted. Query specific columns/byte ranges to inspect more. No complete-coverage claim is supported.]"
             )
         });
         let result = format!(

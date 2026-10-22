@@ -1,10 +1,15 @@
 pub mod agent;
+pub mod auth;
 pub mod config;
 pub mod db_helpers;
 pub mod evidence_io;
+pub mod execution;
+pub mod investigation;
 pub mod paths;
 pub mod policy;
+pub mod providers;
 pub mod report;
+pub mod runtime;
 pub mod session;
 pub mod tools;
 #[cfg(feature = "tui")]

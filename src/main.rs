@@ -9,8 +9,6 @@ use exhume_agent::report::{self, ReportMode};
 use exhume_agent::session::AgentSession;
 use exhume_agent::tui;
 use exhume_agent::ui::UiHandle;
-use exhume_body::Body;
-use std::io::Write;
 use std::process::exit;
 
 pub mod index;
@@ -18,6 +16,22 @@ pub mod index;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Account action, without opening any evidence: login, status, refresh, logout, models
+    #[arg(long)]
+    auth: Option<String>,
+
+    /// Authentication mode: api_key or subscription
+    #[arg(long, value_parser = ["api_key", "subscription"])]
+    auth_mode: Option<String>,
+
+    /// Connected account identifier
+    #[arg(long, env = "AGENT_ACCOUNT_ID")]
+    account_id: Option<String>,
+
+    /// Path to the official provider runtime (Claude Code or Vibe)
+    #[arg(long, env = "AGENT_RUNTIME_PATH")]
+    runtime_path: Option<String>,
+
     /// Path to the disk image (EWF, raw, etc.)
     #[arg(short, long, conflicts_with = "folder")]
     image: Option<String>,
@@ -26,7 +40,7 @@ struct Args {
     #[arg(short, long, conflicts_with = "image")]
     folder: Option<String>,
 
-    /// LLM Provider (openai, ollama, or copilot)
+    /// Model provider (openai, mistral, claude, ollama, or copilot)
     #[arg(short, long, env = "AGENT_PROVIDER")]
     provider: Option<String>,
 
@@ -69,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    if let Some(action) = args.auth.as_deref() {
+        return account_action(&args, action).await;
+    }
 
     println!(
         "{}",
@@ -78,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     );
     println!(
         "{}",
-        " 🕵️  Exhume Agent - Autonomous Forensic Assistant"
+        " 🕵️  Exhume Agent - Investigator-led Forensic Assistant"
             .blue()
             .bold()
     );
@@ -111,23 +128,8 @@ async fn main() -> anyhow::Result<()> {
         target_path
     );
 
-    if !is_folder {
-        // Verify the image can be opened
-        let body_res = std::panic::catch_unwind(|| Body::new(target_path.clone(), "auto"));
-
-        if body_res.is_err() {
-            eprintln!(
-                "{}",
-                format!("Error: Failed to open image at {}", target_path).red()
-            );
-            exit(1);
-        }
-    } else if !std::path::Path::new(&target_path).is_dir() {
-        eprintln!(
-            "{}",
-            format!("Error: {} is not a valid directory.", target_path).red()
-        );
-        exit(1);
+    if !std::path::Path::new(&target_path).exists() {
+        anyhow::bail!("Selected evidence source does not exist");
     }
 
     let db_path = args
@@ -139,7 +141,24 @@ async fn main() -> anyhow::Result<()> {
     println!("{} {}", "Index Database:".bold(), db_path.display());
 
     // Attempt building config
-    let config = AgentConfig::from_environment_or_args(args.provider, args.model, args.endpoint)?;
+    let mut config = AgentConfig::from_environment_or_args_with_auth(
+        args.provider,
+        args.model,
+        args.endpoint,
+        args.auth_mode.as_deref().map(|mode| {
+            if mode == "subscription" {
+                exhume_agent::auth::AuthMode::Subscription
+            } else {
+                exhume_agent::auth::AuthMode::ApiKey
+            }
+        }),
+    )?;
+    if args.account_id.is_some() {
+        config.account_id = args.account_id;
+    }
+    if args.runtime_path.is_some() {
+        config.runtime_path = args.runtime_path;
+    }
 
     println!("{} {}", "LLM Provider:".bold(), config.provider);
     println!("{} {}", "LLM Model:".bold(), config.model);
@@ -148,7 +167,14 @@ async fn main() -> anyhow::Result<()> {
     let model = config.model.clone();
 
     // Initialize Index
-    let pool = match index::init_index(&target_path, &db_path, is_folder, args.logical).await {
+    let pool = match index::open_investigation_index(
+        &target_path,
+        &db_path,
+        is_folder,
+        args.logical,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
@@ -204,15 +230,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let report_mode = prompt_report_mode(
-        &target_path,
-        &db_path,
-        is_folder,
-        args.logical,
-        pool.as_ref(),
-    )
-    .await?;
-
     let (ui, ui_rx) = UiHandle::channel_with_context("default", evidence_id, 512);
     let agent = ExhumeAgent::new_with_options(
         config,
@@ -220,15 +237,23 @@ async fn main() -> anyhow::Result<()> {
         db_path,
         pool.clone(),
         args.logical,
-        report_mode.enabled,
+        true,
         Some(ui),
         options,
     );
     let session = AgentSession::open(agent).await?;
+    let report_mode = ReportMode {
+        enabled: true,
+        export_path: session.investigation_snapshot().await?.report_path,
+    };
+    println!(
+        "Automatic Markdown report: {}",
+        report_mode.export_path.display()
+    );
 
     println!(
         "{}",
-        "Type your investigation query and press Enter. Type 'exit' to quit.".green()
+        "Describe the case objective to prepare the first proposal. /help lists investigator commands. Type 'exit' to quit.".green()
     );
     println!(
         "\n{}",
@@ -249,42 +274,130 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn prompt_report_mode(
-    target_path: &str,
-    db_path: &std::path::Path,
-    is_folder: bool,
-    is_logical: bool,
-    pool: &sqlx::SqlitePool,
-) -> anyhow::Result<ReportMode> {
-    let default_export_path =
-        report::default_export_path(db_path, target_path, is_folder, is_logical);
-    print!(
-        "{} Start a persisted Digital Forensics Report now? [r]eport / [b]rowse only (default: b): ",
-        "Prompt:".cyan().bold()
-    );
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let wants_report = matches!(input.trim().to_ascii_lowercase().as_str(), "r" | "report");
-
-    if wants_report {
-        let mode =
-            report::initialize_report(pool, db_path, target_path, is_folder, is_logical).await?;
-        println!(
-            "{} Report initialized and exported to {}",
-            "Info:".yellow(),
-            mode.export_path.display()
-        );
-        Ok(mode)
-    } else {
-        println!(
-            "{} Browse-only mode selected. Reporting is disabled for this session.",
-            "Info:".yellow()
-        );
-        Ok(ReportMode {
-            enabled: false,
-            export_path: default_export_path,
-        })
+async fn account_action(args: &Args, action: &str) -> anyhow::Result<()> {
+    use exhume_agent::{auth, providers::runtimes};
+    let provider = args
+        .provider
+        .clone()
+        .or_else(|| std::env::var("AGENT_PROVIDER").ok())
+        .unwrap_or_else(|| "openai".into());
+    let config = AgentConfig {
+        provider: provider.clone(),
+        model: args.model.clone().unwrap_or_default(),
+        endpoint: String::new(),
+        api_key: String::new(),
+        auth_mode: auth::AuthMode::Subscription,
+        account_id: args.account_id.clone(),
+        runtime_path: args.runtime_path.clone(),
+        llm_endpoint: None,
+        image_endpoint: None,
+        audio_endpoint: None,
+    };
+    match (provider.as_str(), action) {
+        ("openai", "login") => {
+            let pending = auth::begin_chatgpt_sign_in(args.account_id.as_deref()).await?;
+            open_browser(&pending.authorization_url)?;
+            println!("Complete Sign in with ChatGPT in your browser.");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&pending.complete().await?)?
+            );
+        }
+        ("openai" | "mistral", "status") => println!(
+            "{}",
+            serde_json::to_string_pretty(&auth::account_status()?)?
+        ),
+        ("openai" | "mistral", "refresh") => println!(
+            "{}",
+            serde_json::to_string_pretty(&auth::refresh_account_status().await?)?
+        ),
+        ("openai", "logout") => {
+            let id = args
+                .account_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Select --account-id to disconnect"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&auth::disconnect_chatgpt(id).await?)?
+            );
+        }
+        ("mistral", "logout") => {
+            let id = args
+                .account_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Select --account-id to disconnect"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&auth::disconnect_mistral(id)?)?
+            );
+        }
+        ("mistral", "models") => {
+            let id = args
+                .account_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Select --account-id"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&auth::mistral_models(id).await?)?
+            );
+        }
+        ("openai", "models") => {
+            let id = args
+                .account_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Select --account-id"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&auth::chatgpt_models(id).await?)?
+            );
+        }
+        ("claude" | "anthropic" | "mistral", "login" | "logout") => {
+            let operation = if action == "login" {
+                runtimes::RuntimeAuthAction::Login
+            } else {
+                runtimes::RuntimeAuthAction::Logout
+            };
+            let status = runtimes::native_auth_command(&config, operation)?
+                .status()
+                .await?;
+            if !status.success() {
+                anyhow::bail!("Official runtime account action did not succeed");
+            }
+            if provider == "mistral" && action == "login" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &auth::import_mistral_runtime_credentials(
+                            args.account_id.as_deref().unwrap_or("mistral-default")
+                        )
+                        .await?
+                    )?
+                );
+            }
+        }
+        ("claude" | "anthropic", "status") => println!(
+            "{}",
+            serde_json::to_string_pretty(&runtimes::native_account_status(&config).await?)?
+        ),
+        _ => anyhow::bail!("Unsupported account action/provider combination"),
     }
+    Ok(())
+}
+
+fn open_browser(url: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    let status = command.arg(url).status()?;
+    if !status.success() {
+        anyhow::bail!("Could not open the system browser");
+    }
+    Ok(())
 }
