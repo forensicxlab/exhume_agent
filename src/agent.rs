@@ -24,6 +24,8 @@ pub struct AgentToolContext {
     pub extraction_dir: std::path::PathBuf,
     pub pool: Arc<SqlitePool>,
     pub ui: Option<UiHandle>,
+    /// Host-only credentials. Do not include these in model inputs or case records.
+    pub body_open_options: Arc<exhume_body::BodyOpenOptions>,
 }
 
 pub trait AgentToolProvider: Send + Sync {
@@ -53,6 +55,7 @@ pub struct ExhumeAgent {
     pub(crate) options: AgentOptions,
     pub(crate) investigation: Arc<tokio::sync::OnceCell<crate::investigation::InvestigationStore>>,
     tool_providers: Vec<Arc<dyn AgentToolProvider>>,
+    body_open_options: Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl ExhumeAgent {
@@ -120,11 +123,19 @@ impl ExhumeAgent {
             options,
             investigation: Arc::new(tokio::sync::OnceCell::new()),
             tool_providers: Vec::new(),
+            body_open_options: Arc::default(),
         }
     }
 
     pub fn with_tool_provider(mut self, provider: Arc<dyn AgentToolProvider>) -> Self {
         self.tool_providers.push(provider);
+        self
+    }
+
+    /// Supply credentials for the selected image to every evidence-reading tool.
+    /// They remain in host memory and are not part of the model configuration.
+    pub fn with_body_open_options(mut self, options: Arc<exhume_body::BodyOpenOptions>) -> Self {
+        self.body_open_options = options;
         self
     }
 
@@ -350,57 +361,71 @@ impl ExhumeAgent {
 
     pub(crate) fn build_tools(&self, evidence_id: i64) -> Vec<Box<dyn ToolDyn>> {
         let mut tools: Vec<Box<dyn ToolDyn>> = vec![
-            Box::new(ListPartitionsTool::new(
-                self.image_path.clone(),
-                self.ui.clone(),
-            )),
-            Box::new(DetectFilesystemTool::new(
-                self.image_path.clone(),
-                self.pool.clone(),
-                self.ui.clone(),
-            )),
-            Box::new(ListDirTool::new(
-                self.image_path.clone(),
-                self.pool.clone(),
-                self.ui.clone(),
-            )),
-            Box::new(ExtractFileTool::new(
-                self.image_path.clone(),
-                self.extraction_dir.clone(),
-                self.pool.clone(),
-                self.ui.clone(),
-            )),
+            Box::new(
+                ListPartitionsTool::new(self.image_path.clone(), self.ui.clone())
+                    .with_body_open_options(self.body_open_options.clone()),
+            ),
+            Box::new(
+                DetectFilesystemTool::new(
+                    self.image_path.clone(),
+                    self.pool.clone(),
+                    self.ui.clone(),
+                )
+                .with_body_open_options(self.body_open_options.clone()),
+            ),
+            Box::new(
+                ListDirTool::new(self.image_path.clone(), self.pool.clone(), self.ui.clone())
+                    .with_body_open_options(self.body_open_options.clone()),
+            ),
+            Box::new(
+                ExtractFileTool::new(
+                    self.image_path.clone(),
+                    self.extraction_dir.clone(),
+                    self.pool.clone(),
+                    self.ui.clone(),
+                )
+                .with_body_open_options(self.body_open_options.clone()),
+            ),
             Box::new(QueryIndexTool::new(
                 self.db_path.clone(),
                 self.ui.clone(),
                 self.options.policy.clone(),
             )),
-            Box::new(QuerySqliteFileTool::new(
-                self.image_path.clone(),
-                self.extraction_dir.clone(),
-                self.pool.clone(),
-                self.ui.clone(),
-                self.options.policy.clone(),
-            )),
+            Box::new(
+                QuerySqliteFileTool::new(
+                    self.image_path.clone(),
+                    self.extraction_dir.clone(),
+                    self.pool.clone(),
+                    self.ui.clone(),
+                    self.options.policy.clone(),
+                )
+                .with_body_open_options(self.body_open_options.clone()),
+            ),
         ];
 
         if media_destination(&self.config, "describe_image").is_ok() {
-            tools.push(Box::new(DescribeImageTool::new(
-                self.pool.clone(),
-                evidence_id,
-                self.config.clone(),
-                self.image_path.clone(),
-                self.extraction_dir.clone(),
-            )));
+            tools.push(Box::new(
+                DescribeImageTool::new(
+                    self.pool.clone(),
+                    evidence_id,
+                    self.config.clone(),
+                    self.image_path.clone(),
+                    self.extraction_dir.clone(),
+                )
+                .with_body_open_options(self.body_open_options.clone()),
+            ));
         }
         if media_destination(&self.config, "transcribe_audio").is_ok() {
-            tools.push(Box::new(TranscribeAudioTool::new(
-                self.pool.clone(),
-                evidence_id,
-                self.config.clone(),
-                self.image_path.clone(),
-                self.extraction_dir.clone(),
-            )));
+            tools.push(Box::new(
+                TranscribeAudioTool::new(
+                    self.pool.clone(),
+                    evidence_id,
+                    self.config.clone(),
+                    self.image_path.clone(),
+                    self.extraction_dir.clone(),
+                )
+                .with_body_open_options(self.body_open_options.clone()),
+            ));
         }
 
         if self.options.policy.allow_shell {
@@ -418,6 +443,7 @@ impl ExhumeAgent {
             extraction_dir: self.extraction_dir.clone(),
             pool: self.pool.clone(),
             ui: self.ui.clone(),
+            body_open_options: self.body_open_options.clone(),
         };
         for provider in &self.tool_providers {
             tools.extend(provider.tools(&context));

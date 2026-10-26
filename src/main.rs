@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use colored::*;
 use dotenvy::dotenv;
 use exhume_agent::agent::ExhumeAgent;
@@ -9,6 +9,7 @@ use exhume_agent::report::{self, ReportMode};
 use exhume_agent::session::AgentSession;
 use exhume_agent::tui;
 use exhume_agent::ui::UiHandle;
+use exhume_body::{credentials, Body};
 use std::process::exit;
 
 pub mod index;
@@ -82,7 +83,11 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let args = Args::parse();
+    let matches = password_args(Args::command())
+        .mut_arg("password_file", |arg| arg.requires("image"))
+        .mut_arg("password_stdin", |arg| arg.requires("image"))
+        .get_matches();
+    let args = Args::from_arg_matches(&matches)?;
     if let Some(action) = args.auth.as_deref() {
         return account_action(&args, action).await;
     }
@@ -130,6 +135,22 @@ async fn main() -> anyhow::Result<()> {
 
     if !std::path::Path::new(&target_path).exists() {
         anyhow::bail!("Selected evidence source does not exist");
+    }
+
+    let body_open_options = std::sync::Arc::new(
+        credentials::read_open_options(
+            &target_path,
+            "auto",
+            matches
+                .get_one::<String>("password_file")
+                .map(String::as_str),
+            matches.get_flag("password_stdin"),
+        )
+        .map_err(anyhow::Error::msg)?,
+    );
+    if !is_folder {
+        // Authenticate before initializing the local case or starting a session.
+        Body::open(target_path.clone(), "auto", &body_open_options)?;
     }
 
     let db_path = args
@@ -211,7 +232,8 @@ async fn main() -> anyhow::Result<()> {
         false,
         None,
         options.clone(),
-    );
+    )
+    .with_body_open_options(body_open_options.clone());
     let mut existing_messages = agent_probe.load_history().await.unwrap_or_default();
 
     if args.new_session && !existing_messages.is_empty() {
@@ -240,7 +262,8 @@ async fn main() -> anyhow::Result<()> {
         true,
         Some(ui),
         options,
-    );
+    )
+    .with_body_open_options(body_open_options);
     let session = AgentSession::open(agent).await?;
     let report_mode = ReportMode {
         enabled: true,
@@ -400,4 +423,24 @@ fn open_browser(url: &str) -> anyhow::Result<()> {
         anyhow::bail!("Could not open the system browser");
     }
     Ok(())
+}
+
+/// Register this executable's mutually exclusive container-password sources.
+fn password_args(command: clap::Command) -> clap::Command {
+    command
+        .arg(
+            clap::Arg::new("password_file")
+                .long("password-file")
+                .global(true)
+                .value_name("PATH")
+                .conflicts_with("password_stdin")
+                .help("Read the image container password from a file; remove one trailing line ending."),
+        )
+        .arg(
+            clap::Arg::new("password_stdin")
+                .long("password-stdin")
+                .global(true)
+                .action(clap::ArgAction::SetTrue)
+                .help("Read the image container password from stdin; remove one trailing line ending."),
+        )
 }

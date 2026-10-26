@@ -1,6 +1,6 @@
 use crate::config::AgentConfig;
 use crate::db_helpers::{ensure_ai_artifact, store_specialist_result};
-use crate::evidence_io::{extract_file_bytes, ExtractedFile};
+use crate::evidence_io::{extract_file_bytes_with_options, ExtractedFile};
 use crate::tools::query_index::validate_read_query;
 use crate::ui::{SpecialistKind, SpecialistUpdate, UiHandle};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -856,9 +856,18 @@ pub struct DelegateImageSpecialist {
     pub image_path: String,
     pub extraction_dir: std::path::PathBuf,
     pub ui: Option<UiHandle>,
+    pub body_open_options: std::sync::Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl DelegateImageSpecialist {
+    pub fn with_body_open_options(
+        mut self,
+        options: std::sync::Arc<exhume_body::BodyOpenOptions>,
+    ) -> Self {
+        self.body_open_options = options;
+        self
+    }
+
     pub fn new(
         evidence_pool: std::sync::Arc<sqlx::SqlitePool>,
         evidence_id: i64,
@@ -874,6 +883,7 @@ impl DelegateImageSpecialist {
             image_path,
             extraction_dir,
             ui,
+            body_open_options: std::sync::Arc::default(),
         }
     }
 }
@@ -963,12 +973,13 @@ impl DelegateImageSpecialist {
         }
 
         progress.stage("Extracting file from evidence...");
-        let extracted = extract_file_bytes(
+        let extracted = extract_file_bytes_with_options(
             &self.evidence_pool,
             &self.image_path,
             args.file_id,
             args.partition_id,
             &self.extraction_dir,
+            &self.body_open_options,
         )
         .await
         .map_err(|e| SpecialistError {
@@ -1114,9 +1125,18 @@ pub struct DelegateAudioSpecialist {
     pub image_path: String,
     pub extraction_dir: std::path::PathBuf,
     pub ui: Option<UiHandle>,
+    pub body_open_options: std::sync::Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl DelegateAudioSpecialist {
+    pub fn with_body_open_options(
+        mut self,
+        options: std::sync::Arc<exhume_body::BodyOpenOptions>,
+    ) -> Self {
+        self.body_open_options = options;
+        self
+    }
+
     pub fn new(
         evidence_pool: std::sync::Arc<sqlx::SqlitePool>,
         evidence_id: i64,
@@ -1132,6 +1152,7 @@ impl DelegateAudioSpecialist {
             image_path,
             extraction_dir,
             ui,
+            body_open_options: std::sync::Arc::default(),
         }
     }
 }
@@ -1221,12 +1242,13 @@ impl DelegateAudioSpecialist {
         }
 
         progress.stage("Extracting file from evidence...");
-        let extracted = extract_file_bytes(
+        let extracted = extract_file_bytes_with_options(
             &self.evidence_pool,
             &self.image_path,
             args.file_id,
             args.partition_id,
             &self.extraction_dir,
+            &self.body_open_options,
         )
         .await
         .map_err(|e| SpecialistError {
@@ -1440,9 +1462,18 @@ pub struct DelegateSqliteSpecialist {
     pub image_path: String,
     pub extraction_dir: std::path::PathBuf,
     pub ui: Option<UiHandle>,
+    pub body_open_options: std::sync::Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl DelegateSqliteSpecialist {
+    pub fn with_body_open_options(
+        mut self,
+        options: std::sync::Arc<exhume_body::BodyOpenOptions>,
+    ) -> Self {
+        self.body_open_options = options;
+        self
+    }
+
     pub fn new(
         evidence_pool: std::sync::Arc<sqlx::SqlitePool>,
         evidence_id: i64,
@@ -1458,6 +1489,7 @@ impl DelegateSqliteSpecialist {
             image_path,
             extraction_dir,
             ui,
+            body_open_options: std::sync::Arc::default(),
         }
     }
 }
@@ -1620,12 +1652,13 @@ impl DelegateSqliteSpecialist {
         }
 
         progress.stage("Extracting file from evidence...");
-        let extracted = extract_file_bytes(
+        let extracted = extract_file_bytes_with_options(
             &self.evidence_pool,
             &self.image_path,
             args.file_id,
             args.partition_id,
             &self.extraction_dir,
+            &self.body_open_options,
         )
         .await
         .map_err(|e| SpecialistError {

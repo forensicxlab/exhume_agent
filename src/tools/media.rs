@@ -59,6 +59,7 @@ struct MediaSource {
     config: AgentConfig,
     image_path: String,
     extraction_dir: PathBuf,
+    body_open_options: Arc<exhume_body::BodyOpenOptions>,
 }
 #[derive(Clone)]
 pub struct DescribeImageTool(MediaSource);
@@ -169,20 +170,25 @@ impl MediaSource {
             let path = evidence_io::confined_source_path(Path::new(&self.image_path), &relative)?;
             std::fs::metadata(path)?.len()
         } else {
-            let mut fs =
-                evidence_io::open_filesystem(&self.image_path, args.partition_id, &self.pool)
-                    .await?;
+            let mut fs = evidence_io::open_filesystem_with_options(
+                &self.image_path,
+                args.partition_id,
+                &self.pool,
+                &self.body_open_options,
+            )
+            .await?;
             fs.get_file(args.file_id)
                 .map_err(|e| anyhow!("Media source lookup failed: {e}"))?
                 .size()
         };
         check_size(size)?;
-        let extracted = evidence_io::extract_file_bytes(
+        let extracted = evidence_io::extract_file_bytes_with_options(
             &self.pool,
             &self.image_path,
             args.file_id,
             args.partition_id,
             &self.extraction_dir,
+            &self.body_open_options,
         )
         .await?;
         check_size(extracted.content.len() as u64)?;
@@ -370,7 +376,11 @@ macro_rules! media_tool {
     ($type:ident, $name:literal, $description:literal) => {
         impl $type {
             pub fn new(pool: Arc<SqlitePool>, evidence_id: i64, config: AgentConfig, image_path: String, extraction_dir: PathBuf) -> Self {
-                Self(MediaSource { pool, evidence_id, config, image_path, extraction_dir })
+                Self(MediaSource { pool, evidence_id, config, image_path, extraction_dir, body_open_options: Arc::default() })
+            }
+            pub fn with_body_open_options(mut self, options: Arc<exhume_body::BodyOpenOptions>) -> Self {
+                self.0.body_open_options = options;
+                self
             }
         }
         impl Tool for $type {
@@ -485,6 +495,7 @@ mod tests {
             config: config(),
             image_path: evidence.display().to_string(),
             extraction_dir: extraction.clone(),
+            body_open_options: Arc::default(),
         };
         let args = MediaArgs {
             file_id: 1,

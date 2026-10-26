@@ -83,7 +83,7 @@ impl Tool for QueryIndexTool {
             name: Self::NAME.to_string(),
             description: "Execute one read-only SQL query against the local SQLite forensic index. \
                 Use COUNT queries before broad result queries and add WHERE/LIMIT clauses. \
-                Primary tables are system_files, partitions, artifacts, artifact_objects, and investigation_notes."
+                Primary tables are system_files, partitions, artifacts, artifact_objects, index_runs, index_issues, index_inventory, and investigation_notes. Check index_inventory and index_runs for coverage gaps before drawing absence conclusions."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

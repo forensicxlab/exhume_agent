@@ -1,8 +1,8 @@
 use colored::*;
-use exhume_body::Body;
+use exhume_body::{Body, BodyOpenOptions};
 use exhume_indexer::{
-    ensure_evidence_row, ensure_tables, get_partition, index_partition, insert_partition,
-    IndexerEvent, IndexerEventType, PartitionKind,
+    ensure_evidence_row, ensure_tables, get_partition, index_partition_with_options_report,
+    insert_partition, IndexerEvent, IndexerEventType, PartitionKind,
 };
 use exhume_partitions::Partitions;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -38,11 +38,17 @@ fn spawn_progress_monitor(mut rx: mpsc::Receiver<IndexerEvent>) -> JoinHandle<()
                 IndexerEventType::Success => {
                     pb.finish_with_message(format!("{} {}", "[SUCCESS]".green(), event.message));
                 }
-                IndexerEventType::Warning => {
-                    pb.println(format!("      {} {}", "[WARN]".yellow(), event.message))
-                }
+                IndexerEventType::WalkIssue(_) => {}
+                IndexerEventType::Warning => log::warn!("{}", event.message),
                 IndexerEventType::Error => {
                     pb.println(format!("      {} {}", "[ERROR]".red(), event.message))
+                }
+                IndexerEventType::Issue { fatal, .. } => {
+                    if fatal {
+                        log::error!("{}", event.message);
+                    } else {
+                        log::warn!("{}", event.message);
+                    }
                 }
             }
         }
@@ -117,6 +123,23 @@ pub async fn init_index(
     is_folder: bool,
     is_logical: bool,
 ) -> anyhow::Result<SqlitePool> {
+    init_index_with_options(
+        target_path,
+        db_path,
+        is_folder,
+        is_logical,
+        &BodyOpenOptions::default(),
+    )
+    .await
+}
+
+pub async fn init_index_with_options(
+    target_path: &str,
+    db_path: &Path,
+    is_folder: bool,
+    is_logical: bool,
+    body_options: &BodyOpenOptions,
+) -> anyhow::Result<SqlitePool> {
     let index_exists = db_path.exists();
 
     let opts = SqliteConnectOptions::new()
@@ -182,7 +205,7 @@ pub async fn init_index(
             kind: "FOLDER",
         });
     } else if !is_logical {
-        let mut body = Body::new(target_path.to_string(), "auto");
+        let mut body = Body::open(target_path.to_string(), "auto", body_options)?;
         sector_size = body.get_sector_size() as u64;
 
         let partitions = match Partitions::new(&mut body) {
@@ -324,6 +347,7 @@ pub async fn init_index(
     );
 
     let total_partitions = work.len();
+    let mut had_issues = false;
     for (idx, p) in work.iter().enumerate() {
         println!(
             "  - Indexing {} partition {}/{}",
@@ -335,8 +359,9 @@ pub async fn init_index(
         let (tx, rx) = mpsc::channel::<IndexerEvent>(100);
         let monitor = spawn_progress_monitor(rx);
 
+        let mut partition_error = None;
         if p.kind == "FOLDER" {
-            exhume_indexer::index_folder(
+            match exhume_indexer::index_folder_with_report(
                 evidence_id,
                 p.id,
                 target_path.to_string(),
@@ -344,32 +369,60 @@ pub async fn init_index(
                 Some(tx.clone()),
                 None,
             )
-            .await;
+            .await
+            {
+                Ok(report) => {
+                    had_issues |= report.status != exhume_indexer::IndexStatus::Complete;
+                    if matches!(
+                        report.status,
+                        exhume_indexer::IndexStatus::Failed
+                            | exhume_indexer::IndexStatus::Aborted
+                            | exhume_indexer::IndexStatus::Cancelled
+                    ) {
+                        partition_error = Some(report.summary());
+                    }
+                }
+                Err(error) => partition_error = Some(error.to_string()),
+            }
         } else {
             loop {
-                match index_partition(
+                match index_partition_with_options_report(
                     evidence_id,
                     p.id,
                     p.size_sectors,
                     p.first_byte_addr,
                     target_path.to_string(),
+                    "auto",
+                    body_options,
                     &pool,
                     Some(tx.clone()),
                     None,
                 )
                 .await
                 {
-                    Ok(_) => break,
+                    Ok(report) => {
+                        had_issues |= report.status != exhume_indexer::IndexStatus::Complete;
+                        if matches!(
+                            report.status,
+                            exhume_indexer::IndexStatus::Failed
+                                | exhume_indexer::IndexStatus::Aborted
+                                | exhume_indexer::IndexStatus::Cancelled
+                        ) {
+                            partition_error = Some(report.summary());
+                        }
+                        break;
+                    }
                     Err(e) if e.to_string().contains("-FVE-FS-") => {
                         if prompt_fvek_and_update_db(&pool, p.id, &p.kind)
                             .await
                             .is_err()
                         {
+                            partition_error = Some("BitLocker key entry cancelled".to_owned());
                             break;
                         }
                     }
                     Err(e) => {
-                        println!("      {} Indexing failed: {}", "[ERROR]".red(), e);
+                        partition_error = Some(e.to_string());
                         break;
                     }
                 }
@@ -378,9 +431,18 @@ pub async fn init_index(
 
         drop(tx);
         let _ = monitor.await;
+        if let Some(error) = partition_error {
+            anyhow::bail!("Partition {} indexing failed: {error}", p.id);
+        }
     }
 
-    println!("\n{} Local index built successfully.", "Success:".green());
+    if had_issues {
+        log::warn!(
+            "Index completed with issues. See index_runs and index_issues for coverage gaps."
+        );
+    } else {
+        println!("\n{} Local index built successfully.", "Success:".green());
+    }
 
     // Populate Full-Text Search index
     println!("{} Building full-text search index...", "Info:".yellow());
@@ -389,11 +451,7 @@ pub async fn init_index(
         .await
     {
         Ok(_) => println!("{} FTS index built.", "Success:".green()),
-        Err(e) => println!(
-            "{} FTS index build failed (non-fatal, may be read-only volume): {}",
-            "Warning:".yellow(),
-            e
-        ),
+        Err(e) => log::warn!("FTS index build failed (non-fatal, may be read-only volume): {e}"),
     }
 
     print!(
@@ -450,7 +508,7 @@ pub async fn init_index(
             let mut fs_res = if is_folder {
                 exhume_filesystem::detected_fs::detect_filesystem_from_path(target_path)
             } else {
-                let mut body_scan = Body::new(target_path.to_string(), "auto");
+                let mut body_scan = Body::open(target_path.to_string(), "auto", body_options)?;
                 let sector_size_scan = body_scan.get_sector_size() as u64;
                 let partition_size_bytes = p.size_sectors * sector_size_scan;
 
@@ -478,7 +536,8 @@ pub async fn init_index(
                             }
                         });
 
-                        let mut body_scan = Body::new(target_path.to_string(), "auto");
+                        let mut body_scan =
+                            Body::open(target_path.to_string(), "auto", body_options)?;
                         let sector_size_scan = body_scan.get_sector_size() as u64;
                         let partition_size_bytes = p.size_sectors * sector_size_scan;
 

@@ -1,4 +1,4 @@
-use exhume_body::Body;
+use exhume_body::{Body, BodyOpenOptions};
 use exhume_filesystem::detected_fs::{
     detect_filesystem, detect_filesystem_from_path, DetectedFs, ImageStream, KeyMaterial,
 };
@@ -82,6 +82,17 @@ pub async fn open_filesystem(
     partition_id: i64,
     pool: &SqlitePool,
 ) -> Result<DetectedFs<ImageStream>, EvidenceIOError> {
+    open_filesystem_with_options(image_path, partition_id, pool, &BodyOpenOptions::default()).await
+}
+
+/// Open with host-supplied container credentials; these are never read from
+/// model arguments or persisted in the index.
+pub async fn open_filesystem_with_options(
+    image_path: &str,
+    partition_id: i64,
+    pool: &SqlitePool,
+    options: &BodyOpenOptions,
+) -> Result<DetectedFs<ImageStream>, EvidenceIOError> {
     // If it's a folder, use the folder path directly
     if Path::new(image_path).is_dir() {
         return detect_filesystem_from_path(image_path)
@@ -103,7 +114,7 @@ pub async fn open_filesystem(
             bitlocker_fvek: Some(fvek),
         });
 
-    let body = Body::try_new(image_path.to_string(), "auto").map_err(|error| {
+    let body = Body::open(image_path.to_string(), "auto", options).map_err(|error| {
         EvidenceIOError(format!(
             "Unable to open evidence source '{}': {error}",
             image_path
@@ -121,6 +132,25 @@ pub async fn extract_file_bytes(
     file_id: u64,
     partition_id: i64,
     extraction_dir: &Path,
+) -> Result<ExtractedFile, EvidenceIOError> {
+    extract_file_bytes_with_options(
+        pool,
+        image_path,
+        file_id,
+        partition_id,
+        extraction_dir,
+        &BodyOpenOptions::default(),
+    )
+    .await
+}
+
+pub async fn extract_file_bytes_with_options(
+    pool: &SqlitePool,
+    image_path: &str,
+    file_id: u64,
+    partition_id: i64,
+    extraction_dir: &Path,
+    options: &BodyOpenOptions,
 ) -> Result<ExtractedFile, EvidenceIOError> {
     let file_row = sqlx::query(
         "SELECT id, evidence_id, name, absolute_path FROM system_files WHERE identifier = ? AND partition_id = ? LIMIT 1",
@@ -149,7 +179,7 @@ pub async fn extract_file_bytes(
             EvidenceIOError(format!("Local FS Error reading {:?}: {}", full_path, e))
         })?
     } else {
-        let mut fs = open_filesystem(image_path, partition_id, pool).await?;
+        let mut fs = open_filesystem_with_options(image_path, partition_id, pool, options).await?;
 
         let file = fs.get_file(file_id).map_err(|e| {
             EvidenceIOError(format!("File lookup failed for id {}: {}", file_id, e))

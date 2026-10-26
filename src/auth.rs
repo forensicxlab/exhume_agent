@@ -327,7 +327,12 @@ pub fn save_api_key(profile: &str, key: &str) -> Result<()> {
     stored.save_sync()
 }
 pub fn load_api_key(profile: &str) -> Result<Option<String>> {
-    Ok(CredentialStore::native()?.load_locked()?.vault.api_keys.get(profile).cloned())
+    Ok(CredentialStore::native()?
+        .load_locked()?
+        .vault
+        .api_keys
+        .get(profile)
+        .cloned())
 }
 pub fn delete_api_key(profile: &str) -> Result<()> {
     let mut stored = CredentialStore::native()?.load_locked()?;
@@ -369,21 +374,16 @@ fn vault_account_status(vault: &Vault) -> Vec<AccountStatus> {
             }
         })
         .collect();
-    result.extend(
-        vault
-            .mistral_accounts
-            .iter()
-            .map(|(id, r)| AccountStatus {
-                provider: "mistral".into(),
-                account_id: id.clone(),
-                email: None,
-                subject: r.label.clone(),
-                connected: r.api_key.is_some(),
-                expires_at: None,
-                plan_usage_enabled: false,
-                usage_source: "mistral_account_api_allowance_or_payg".into(),
-            }),
-    );
+    result.extend(vault.mistral_accounts.iter().map(|(id, r)| AccountStatus {
+        provider: "mistral".into(),
+        account_id: id.clone(),
+        email: None,
+        subject: r.label.clone(),
+        connected: r.api_key.is_some(),
+        expires_at: None,
+        plan_usage_enabled: false,
+        usage_source: "mistral_account_api_allowance_or_payg".into(),
+    }));
     result
 }
 fn has_plan_scope(scopes: &[String]) -> bool {
@@ -408,7 +408,8 @@ pub async fn begin_chatgpt_sign_in(account_id: Option<&str>) -> Result<PendingSi
     let changed = ensure_host_id(&mut stored.vault)?;
     let selected = account_id
         .map(|id| {
-            stored.vault
+            stored
+                .vault
                 .accounts
                 .get(id)
                 .cloned()
@@ -559,19 +560,31 @@ async fn read_callback_target(stream: &mut tokio::net::TcpStream) -> Result<Opti
             if words.next().is_some() || !matches!(version, Some("HTTP/1.0" | "HTTP/1.1")) {
                 bail!("Invalid sign-in callback request line");
             }
-            return Ok(target.filter(|target| method == Some("GET") && target.starts_with("/auth/callback?")).map(str::to_owned));
+            return Ok(target
+                .filter(|target| method == Some("GET") && target.starts_with("/auth/callback?"))
+                .map(str::to_owned));
         }
     }
 }
 
 async fn callback_reply(stream: &mut tokio::net::TcpStream, accepted: bool) {
     let (status, body) = if accepted {
-        ("200 OK", "Authorization received. Return to Exhume to confirm completion.")
+        (
+            "200 OK",
+            "Authorization received. Return to Exhume to confirm completion.",
+        )
     } else {
-        ("400 Bad Request", "Authorization was not accepted. Return to Exhume to continue or retry sign-in.")
+        (
+            "400 Bad Request",
+            "Authorization was not accepted. Return to Exhume to continue or retry sign-in.",
+        )
     };
     let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-    let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(response.as_bytes())).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.write_all(response.as_bytes()),
+    )
+    .await;
 }
 
 async fn receive_callback(
@@ -584,11 +597,19 @@ async fn receive_callback(
     tokio::time::timeout(overall_timeout, async {
         loop {
             let (mut stream, peer) = listener.accept().await?;
-            if !peer.ip().is_loopback() { continue; }
-            let target = match tokio::time::timeout(connection_timeout, read_callback_target(&mut stream)).await {
-                Ok(Ok(Some(target))) => target,
-                _ => { callback_reply(&mut stream, false).await; continue; }
-            };
+            if !peer.ip().is_loopback() {
+                continue;
+            }
+            let target =
+                match tokio::time::timeout(connection_timeout, read_callback_target(&mut stream))
+                    .await
+                {
+                    Ok(Ok(Some(target))) => target,
+                    _ => {
+                        callback_reply(&mut stream, false).await;
+                        continue;
+                    }
+                };
             match validate_callback(&target, expected_state, registered) {
                 Ok(callback) => {
                     callback_reply(&mut stream, true).await;
@@ -599,22 +620,32 @@ async fn receive_callback(
                     // An explicit authorization denial with the expected state is
                     // terminal. Unrelated, malformed or stale requests cannot end
                     // the investigator's pending sign-in attempt.
-                    if callback_parameters(&target).is_ok_and(|params|
+                    if callback_parameters(&target).is_ok_and(|params| {
                         params.get("state").map(String::as_str) == Some(expected_state)
-                        && params.contains_key("error")) {
+                            && params.contains_key("error")
+                    }) {
                         return Err(error);
                     }
                 }
             }
         }
-    }).await.map_err(|_| anyhow!("Account sign-in timed out; no credentials changed"))?
+    })
+    .await
+    .map_err(|_| anyhow!("Account sign-in timed out; no credentials changed"))?
 }
 
 impl PendingSignIn {
     pub async fn complete(self) -> Result<AccountStatus> {
-        let callback = receive_callback(&self.listener, &self.state,
-            self.selected.as_ref().map(|(_, registration)| registration.client_id.as_str()),
-            Duration::from_secs(300), Duration::from_secs(5)).await?;
+        let callback = receive_callback(
+            &self.listener,
+            &self.state,
+            self.selected
+                .as_ref()
+                .map(|(_, registration)| registration.client_id.as_str()),
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await?;
         let response = token_request(&[
             ("grant_type", "authorization_code"),
             ("client_id", &callback.client_id),
@@ -854,12 +885,14 @@ pub struct DisconnectResult {
 pub async fn disconnect_chatgpt(account_id: &str) -> Result<DisconnectResult> {
     let account_id = account_id.to_string();
     tokio::spawn(async move { disconnect_chatgpt_transaction(&account_id).await })
-        .await.map_err(|_| anyhow!("Account disconnect transaction could not complete"))?
+        .await
+        .map_err(|_| anyhow!("Account disconnect transaction could not complete"))?
 }
 
 async fn disconnect_chatgpt_transaction(account_id: &str) -> Result<DisconnectResult> {
     let mut stored = LockedVault::load().await?;
-    let r = stored.vault
+    let r = stored
+        .vault
         .accounts
         .get_mut(account_id)
         .ok_or_else(|| anyhow!("Unknown account registration"))?;
@@ -897,29 +930,55 @@ pub struct AccountModel {
 const MAX_MODEL_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 async fn read_model_catalog(mut response: reqwest::Response) -> Result<Value> {
     if !response.status().is_success() {
-        bail!("Model catalog failed (HTTP {}); no fallback attempted", response.status().as_u16());
+        bail!(
+            "Model catalog failed (HTTP {}); no fallback attempted",
+            response.status().as_u16()
+        );
     }
-    if response.content_length().is_some_and(|length| length > MAX_MODEL_CATALOG_BYTES as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODEL_CATALOG_BYTES as u64)
+    {
         bail!("Model catalog exceeds the 2 MiB response bound");
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > MAX_MODEL_CATALOG_BYTES { bail!("Model catalog exceeds the 2 MiB response bound"); }
+        if bytes.len() + chunk.len() > MAX_MODEL_CATALOG_BYTES {
+            bail!("Model catalog exceeds the 2 MiB response bound");
+        }
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("Model catalog response is invalid")
 }
 fn parse_chatgpt_models(data: &Value) -> Result<Vec<AccountModel>> {
-    let entries = data["models"].as_array().ok_or_else(|| anyhow!("Account model catalog format is invalid"))?;
-    if entries.len() > 4096 { bail!("Account model catalog exceeds the model-count bound"); }
+    let entries = data["models"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Account model catalog format is invalid"))?;
+    if entries.len() > 4096 {
+        bail!("Account model catalog exceeds the model-count bound");
+    }
     // SIWC catalog order and visibility are provider controlled. Slugs are opaque.
-    entries.iter().filter(|model| model["visibility"] == "list").map(|model| {
-        let id = model["slug"].as_str().filter(|id| !id.trim().is_empty() && id.len() <= 1024)
-            .ok_or_else(|| anyhow!("Account model is missing its ID"))?;
-        let display_name = model["display_name"].as_str().filter(|name| !name.trim().is_empty()).unwrap_or(id);
-        if display_name.len() > 4096 { bail!("Account model name exceeds the size bound"); }
-        Ok(AccountModel { id: id.to_string(), display_name: display_name.to_string() })
-    }).collect()
+    entries
+        .iter()
+        .filter(|model| model["visibility"] == "list")
+        .map(|model| {
+            let id = model["slug"]
+                .as_str()
+                .filter(|id| !id.trim().is_empty() && id.len() <= 1024)
+                .ok_or_else(|| anyhow!("Account model is missing its ID"))?;
+            let display_name = model["display_name"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(id);
+            if display_name.len() > 4096 {
+                bail!("Account model name exceeds the size bound");
+            }
+            Ok(AccountModel {
+                id: id.to_string(),
+                display_name: display_name.to_string(),
+            })
+        })
+        .collect()
 }
 pub async fn chatgpt_models(account_id: &str) -> Result<Vec<AccountModel>> {
     let token = cache::explicit_access_token(CredentialStore::native()?, account_id).await?;
@@ -934,8 +993,12 @@ pub async fn chatgpt_models_cached(account_id: &str) -> Result<Vec<AccountModel>
 }
 
 async fn chatgpt_catalog(token: &str) -> Result<Vec<AccountModel>> {
-    let response = http_client()?.get(format!("{RESOURCE}/models"))
-        .timeout(Duration::from_secs(30)).bearer_auth(token).send().await?;
+    let response = http_client()?
+        .get(format!("{RESOURCE}/models"))
+        .timeout(Duration::from_secs(30))
+        .bearer_auth(token)
+        .send()
+        .await?;
     parse_chatgpt_models(&read_model_catalog(response).await?)
 }
 
@@ -1023,7 +1086,8 @@ pub(crate) async fn mistral_api_key(account_id: Option<&str>) -> Result<String> 
 }
 pub fn disconnect_mistral(account_id: &str) -> Result<DisconnectResult> {
     let mut stored = CredentialStore::native()?.load_locked()?;
-    let r = stored.vault
+    let r = stored
+        .vault
         .mistral_accounts
         .get_mut(account_id)
         .ok_or_else(|| anyhow!("Unknown Mistral connection"))?;
@@ -1035,20 +1099,44 @@ pub fn disconnect_mistral(account_id: &str) -> Result<DisconnectResult> {
     })
 }
 fn parse_mistral_models(value: &Value) -> Result<Vec<AccountModel>> {
-    let entries = value["data"].as_array().or_else(|| value.as_array()).ok_or_else(|| anyhow!("Mistral model catalog is invalid"))?;
-    if entries.len() > 4096 { bail!("Mistral model catalog exceeds the model-count bound"); }
-    entries.iter().filter(|model| model["capabilities"]["completion_chat"] != false && model["archived"] != true)
+    let entries = value["data"]
+        .as_array()
+        .or_else(|| value.as_array())
+        .ok_or_else(|| anyhow!("Mistral model catalog is invalid"))?;
+    if entries.len() > 4096 {
+        bail!("Mistral model catalog exceeds the model-count bound");
+    }
+    entries
+        .iter()
+        .filter(|model| {
+            model["capabilities"]["completion_chat"] != false && model["archived"] != true
+        })
         .map(|model| {
-            let id = model["id"].as_str().filter(|id| !id.trim().is_empty() && id.len() <= 1024)
+            let id = model["id"]
+                .as_str()
+                .filter(|id| !id.trim().is_empty() && id.len() <= 1024)
                 .ok_or_else(|| anyhow!("Mistral model catalog contains an invalid identifier"))?;
-            let display_name = model["name"].as_str().filter(|name| !name.trim().is_empty()).unwrap_or(id);
-            if display_name.len() > 4096 { bail!("Mistral model name exceeds the size bound"); }
-            Ok(AccountModel { id: id.to_string(), display_name: display_name.to_string() })
-        }).collect()
+            let display_name = model["name"]
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(id);
+            if display_name.len() > 4096 {
+                bail!("Mistral model name exceeds the size bound");
+            }
+            Ok(AccountModel {
+                id: id.to_string(),
+                display_name: display_name.to_string(),
+            })
+        })
+        .collect()
 }
 async fn mistral_catalog(key: &str) -> Result<Vec<AccountModel>> {
-    let response = http_client()?.get("https://api.mistral.ai/v1/models")
-        .timeout(Duration::from_secs(30)).bearer_auth(key).send().await
+    let response = http_client()?
+        .get("https://api.mistral.ai/v1/models")
+        .timeout(Duration::from_secs(30))
+        .bearer_auth(key)
+        .send()
+        .await
         .map_err(|_| anyhow!("Cannot validate the Mistral account credential"))?;
     parse_mistral_models(&read_model_catalog(response).await?)
 }
@@ -1065,7 +1153,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("synthetic-credentials.lock");
         let open_lock = |path: &std::path::Path| {
-            OpenOptions::new().create(true).read(true).write(true).open(path).unwrap()
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
         };
         let held_lock = save.then(|| {
             let file = open_lock(&path);
@@ -1093,15 +1186,26 @@ mod tests {
             let _ = finished_tx.send(());
             result.map_err(|_| anyhow!("Synthetic credential operation was not released"))
         }));
-        tokio::time::timeout(Duration::from_secs(2), started_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
         if !save {
-            assert!(tokio::time::timeout(Duration::from_millis(30), &mut task).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_millis(30), &mut task)
+                .await
+                .is_err());
         }
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(competing_lock.try_lock_exclusive().is_err(), "Cancelling the async caller must not release the background operation's lock");
+        assert!(
+            competing_lock.try_lock_exclusive().is_err(),
+            "Cancelling the async caller must not release the background operation's lock"
+        );
         release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), finished_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
         competing_lock.try_lock_exclusive().unwrap();
     }
 
@@ -1227,7 +1331,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(url.origin().ascii_serialization(), "https://auth.openai.com");
+        assert_eq!(
+            url.origin().ascii_serialization(),
+            "https://auth.openai.com"
+        );
         assert_eq!(url.path(), "/api/accounts/authorize");
         let params: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         let expected: BTreeMap<String, String> = [
@@ -1235,12 +1342,18 @@ mod tests {
             ("ext_agent_host_id", vault.host_id.as_str()),
             ("response_type", "code"),
             ("redirect_uri", "http://127.0.0.1:43210/auth/callback"),
-            ("scope", "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"),
+            (
+                "scope",
+                "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+            ),
             ("resource", "https://api.openai.com/v1"),
             ("state", "synthetic-state"),
             ("nonce", "synthetic-nonce"),
             ("code_challenge_method", "S256"),
-            ("code_challenge", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+            (
+                "code_challenge",
+                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            ),
             ("agent_name_hint", "Exhume Agent"),
         ]
         .into_iter()
@@ -1368,13 +1481,24 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let receiver = tokio::spawn(async move {
-            receive_callback(&listener, "synthetic-state", Some("saved-client"),
-                Duration::from_secs(2), Duration::from_secs(1)).await
+            receive_callback(
+                &listener,
+                "synthetic-state",
+                Some("saved-client"),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            )
+            .await
         });
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(b"GET /auth/cal").await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        stream.write_all(b"lback?state=synthetic-state&code=synthetic-code HTTP/1.1\r\nHost: 127.0.0.1\r\n").await.unwrap();
+        stream
+            .write_all(
+                b"lback?state=synthetic-state&code=synthetic-code HTTP/1.1\r\nHost: 127.0.0.1\r\n",
+            )
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         stream.write_all(b"\r\n").await.unwrap();
         let mut response = String::new();
@@ -1390,8 +1514,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let receiver = tokio::spawn(async move {
-            receive_callback(&listener, "synthetic-state", Some("saved-client"),
-                Duration::from_secs(2), Duration::from_millis(30)).await
+            receive_callback(
+                &listener,
+                "synthetic-state",
+                Some("saved-client"),
+                Duration::from_secs(2),
+                Duration::from_millis(30),
+            )
+            .await
         });
         let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut ignored = String::new();
@@ -1405,8 +1535,11 @@ mod tests {
             let response = synthetic_callback_request(address, request.as_bytes()).await;
             assert!(response.starts_with("HTTP/1.1 400"));
         }
-        let response = synthetic_callback_request(address,
-            b"GET /auth/callback?state=synthetic-state&code=accepted HTTP/1.1\r\n\r\n").await;
+        let response = synthetic_callback_request(
+            address,
+            b"GET /auth/callback?state=synthetic-state&code=accepted HTTP/1.1\r\n\r\n",
+        )
+        .await;
         assert!(response.starts_with("HTTP/1.1 200"));
         assert_eq!(receiver.await.unwrap().unwrap().code, "accepted");
     }
@@ -1416,8 +1549,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let receiver = tokio::spawn(async move {
-            receive_callback(&listener, "synthetic-state", None,
-                Duration::from_millis(100), Duration::from_secs(1)).await
+            receive_callback(
+                &listener,
+                "synthetic-state",
+                None,
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+            .await
         });
         let mut oversized = tokio::net::TcpStream::connect(address).await.unwrap();
         oversized.write_all(&vec![b'x'; 16 * 1024]).await.unwrap();
@@ -1426,8 +1565,14 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"));
         // A new connection must not restart the absolute authorization deadline.
         let _idle = tokio::net::TcpStream::connect(address).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_millis(500), receiver).await.unwrap().unwrap();
-        assert!(result.unwrap_err().to_string().contains("sign-in timed out"));
+        let result = tokio::time::timeout(Duration::from_millis(500), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("sign-in timed out"));
     }
 
     #[tokio::test]
@@ -1435,12 +1580,26 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let receiver = tokio::spawn(async move {
-            receive_callback(&listener, "synthetic-state", None,
-                Duration::from_secs(2), Duration::from_secs(1)).await
+            receive_callback(
+                &listener,
+                "synthetic-state",
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+            )
+            .await
         });
-        synthetic_callback_request(address,
-            b"GET /auth/callback?state=synthetic-state&error=access_denied HTTP/1.1\r\n\r\n").await;
-        assert!(receiver.await.unwrap().unwrap_err().to_string().contains("declined or failed"));
+        synthetic_callback_request(
+            address,
+            b"GET /auth/callback?state=synthetic-state&error=access_denied HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert!(receiver
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("declined or failed"));
     }
 
     #[tokio::test]
@@ -1448,9 +1607,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let pending = PendingSignIn {
-            authorization_url: "synthetic".into(), listener,
-            redirect_uri: "synthetic".into(), state: "synthetic".into(),
-            nonce: "synthetic".into(), verifier: "synthetic".into(), selected: None,
+            authorization_url: "synthetic".into(),
+            listener,
+            redirect_uri: "synthetic".into(),
+            state: "synthetic".into(),
+            nonce: "synthetic".into(),
+            verifier: "synthetic".into(),
+            selected: None,
         };
         let task = tokio::spawn(pending.complete());
         tokio::task::yield_now().await;
@@ -1498,18 +1661,30 @@ mod catalog_tests {
     use serde_json::json;
     #[test]
     fn chatgpt_uses_only_visible_slugs_in_provider_order() {
-        let catalog=json!({"models":[{"slug":"second","display_name":"Second choice","visibility":"list"},{"slug":"hidden","visibility":"hidden"},{"slug":"first","visibility":"list"}]});
-        let models=parse_chatgpt_models(&catalog).unwrap();
-        assert_eq!(models.iter().map(|model|model.id.as_str()).collect::<Vec<_>>(),vec!["second","first"]);
-        assert_eq!(models[0].display_name,"Second choice");
-        assert_eq!(models[1].display_name,"first");
+        let catalog = json!({"models":[{"slug":"second","display_name":"Second choice","visibility":"list"},{"slug":"hidden","visibility":"hidden"},{"slug":"first","visibility":"list"}]});
+        let models = parse_chatgpt_models(&catalog).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        assert_eq!(models[0].display_name, "Second choice");
+        assert_eq!(models[1].display_name, "first");
         assert!(parse_chatgpt_models(&json!({"models":[{"visibility":"list"}]})).is_err());
     }
     #[test]
     fn mistral_filters_explicit_non_chat_and_archived_models() {
-        let catalog=json!({"data":[{"id":"chat","name":"Chat","capabilities":{"completion_chat":true}},{"id":"embedding","capabilities":{"completion_chat":false}},{"id":"old","archived":true},{"id":"unspecified"}]});
-        let models=parse_mistral_models(&catalog).unwrap();
-        assert_eq!(models.iter().map(|model|model.id.as_str()).collect::<Vec<_>>(),vec!["chat","unspecified"]);
+        let catalog = json!({"data":[{"id":"chat","name":"Chat","capabilities":{"completion_chat":true}},{"id":"embedding","capabilities":{"completion_chat":false}},{"id":"old","archived":true},{"id":"unspecified"}]});
+        let models = parse_mistral_models(&catalog).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chat", "unspecified"]
+        );
         assert!(parse_mistral_models(&json!({"data":[{}]})).is_err());
     }
 }

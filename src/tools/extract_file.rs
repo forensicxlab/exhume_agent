@@ -38,6 +38,7 @@ pub struct ExtractFileTool {
     extraction_dir: std::path::PathBuf,
     pool: Arc<SqlitePool>,
     ui: Option<UiHandle>,
+    body_open_options: Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl ExtractFileTool {
@@ -52,7 +53,13 @@ impl ExtractFileTool {
             extraction_dir,
             pool,
             ui,
+            body_open_options: Arc::default(),
         }
+    }
+
+    pub fn with_body_open_options(mut self, options: Arc<exhume_body::BodyOpenOptions>) -> Self {
+        self.body_open_options = options;
+        self
     }
 }
 
@@ -109,12 +116,13 @@ impl Tool for ExtractFileTool {
 
         let max_len = args.max_bytes.unwrap_or(8192).clamp(1, 1_048_576);
         if let Some(partition_id) = args.partition_id {
-            let extracted = evidence_io::extract_file_bytes(
+            let extracted = evidence_io::extract_file_bytes_with_options(
                 &self.pool,
                 &self.image_path,
                 args.file_id,
                 partition_id,
                 &self.extraction_dir,
+                &self.body_open_options,
             )
             .await
             .map_err(|error| ExtractFileError(error.to_string()))?;
@@ -128,12 +136,14 @@ impl Tool for ExtractFileTool {
 
         use exhume_body::Body;
         use exhume_filesystem::detected_fs::detect_filesystem;
-        let body = Body::try_new(self.image_path.clone(), "auto").map_err(|error| {
-            ExtractFileError(format!(
-                "Unable to open evidence source '{}': {error}",
-                self.image_path
-            ))
-        })?;
+        let body = Body::open(self.image_path.clone(), "auto", &self.body_open_options).map_err(
+            |error| {
+                ExtractFileError(format!(
+                    "Unable to open evidence source '{}': {error}",
+                    self.image_path
+                ))
+            },
+        )?;
         let mut fs = detect_filesystem(&body, args.offset, args.partition_size, None)
             .map_err(|e| ExtractFileError(format!("Could not mount partition: {}", e)))?;
 

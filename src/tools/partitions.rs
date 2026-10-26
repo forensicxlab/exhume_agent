@@ -31,11 +31,24 @@ pub struct PartitionError(pub String);
 pub struct ListPartitionsTool {
     image_path: String,
     ui: Option<UiHandle>,
+    body_open_options: std::sync::Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl ListPartitionsTool {
     pub fn new(image_path: String, ui: Option<UiHandle>) -> Self {
-        Self { image_path, ui }
+        Self {
+            image_path,
+            ui,
+            body_open_options: std::sync::Arc::default(),
+        }
+    }
+
+    pub fn with_body_open_options(
+        mut self,
+        options: std::sync::Arc<exhume_body::BodyOpenOptions>,
+    ) -> Self {
+        self.body_open_options = options;
+        self
     }
 }
 
@@ -64,12 +77,13 @@ impl Tool for ListPartitionsTool {
         } else {
             tracing::info!("Listing partitions");
         }
-        let mut body = Body::try_new(self.image_path.clone(), "auto").map_err(|error| {
-            PartitionError(format!(
-                "Unable to open evidence source '{}': {error}",
-                self.image_path
-            ))
-        })?;
+        let mut body = Body::open(self.image_path.clone(), "auto", &self.body_open_options)
+            .map_err(|error| {
+                PartitionError(format!(
+                    "Unable to open evidence source '{}': {error}",
+                    self.image_path
+                ))
+            })?;
 
         let sector_size = body.get_sector_size();
         let mut results = Vec::new();

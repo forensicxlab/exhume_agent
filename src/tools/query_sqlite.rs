@@ -1,4 +1,4 @@
-use crate::evidence_io::extract_file_bytes;
+use crate::evidence_io::extract_file_bytes_with_options;
 use crate::policy::AgentPolicy;
 use crate::tools::query_index::validate_read_query;
 use crate::ui::UiHandle;
@@ -43,6 +43,7 @@ pub struct QuerySqliteFileTool {
     evidence_pool: Arc<SqlitePool>,
     ui: Option<UiHandle>,
     policy: AgentPolicy,
+    body_open_options: Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl QuerySqliteFileTool {
@@ -59,7 +60,13 @@ impl QuerySqliteFileTool {
             evidence_pool,
             ui,
             policy,
+            body_open_options: Arc::default(),
         }
+    }
+
+    pub fn with_body_open_options(mut self, options: Arc<exhume_body::BodyOpenOptions>) -> Self {
+        self.body_open_options = options;
+        self
     }
 }
 
@@ -130,12 +137,13 @@ impl Tool for QuerySqliteFileTool {
             ));
         }
 
-        let extracted = extract_file_bytes(
+        let extracted = extract_file_bytes_with_options(
             &self.evidence_pool,
             &self.image_path,
             args.file_id,
             args.partition_id,
             &self.extraction_dir,
+            &self.body_open_options,
         )
         .await
         .map_err(|error| QuerySqliteFileError(error.to_string()))?;

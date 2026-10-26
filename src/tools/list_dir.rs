@@ -42,6 +42,7 @@ pub struct ListDirTool {
     image_path: String,
     pool: Arc<SqlitePool>,
     ui: Option<UiHandle>,
+    body_open_options: Arc<exhume_body::BodyOpenOptions>,
 }
 
 impl ListDirTool {
@@ -50,7 +51,13 @@ impl ListDirTool {
             image_path,
             pool,
             ui,
+            body_open_options: Arc::default(),
         }
+    }
+
+    pub fn with_body_open_options(mut self, options: Arc<exhume_body::BodyOpenOptions>) -> Self {
+        self.body_open_options = options;
+        self
     }
 }
 
@@ -103,18 +110,24 @@ impl Tool for ListDirTool {
         }
 
         let mut fs = if let Some(pid) = args.partition_id {
-            evidence_io::open_filesystem(&self.image_path, pid, &self.pool)
-                .await
-                .map_err(|e| ListDirError(e.to_string()))?
+            evidence_io::open_filesystem_with_options(
+                &self.image_path,
+                pid,
+                &self.pool,
+                &self.body_open_options,
+            )
+            .await
+            .map_err(|e| ListDirError(e.to_string()))?
         } else {
             use exhume_body::Body;
             use exhume_filesystem::detected_fs::detect_filesystem;
-            let body = Body::try_new(self.image_path.clone(), "auto").map_err(|error| {
-                ListDirError(format!(
-                    "Unable to open evidence source '{}': {error}",
-                    self.image_path
-                ))
-            })?;
+            let body = Body::open(self.image_path.clone(), "auto", &self.body_open_options)
+                .map_err(|error| {
+                    ListDirError(format!(
+                        "Unable to open evidence source '{}': {error}",
+                        self.image_path
+                    ))
+                })?;
             detect_filesystem(&body, args.offset, args.partition_size, None)
                 .map_err(|e| ListDirError(format!("Could not mount partition: {}", e)))?
         };
